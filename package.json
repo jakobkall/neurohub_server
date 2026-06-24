@@ -1,0 +1,17 @@
+{
+  "name": "neurohub-server",
+  "version": "1.0.0",
+  "description": "Realtime server for Neurohub",
+  "main": "neurohub_server.js",
+  "scripts": {
+    "start": "node neurohub_server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "mysql2": "^3.9.7",
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
