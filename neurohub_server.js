@@ -20,9 +20,7 @@ require("dotenv").config();
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT;
-server.listen(PORT, () => {
-  console.log(`[neurohub] Server kører korrekt på port ${PORT}`);
-});
+
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "https://jakobkall.com")
   .split(",")
   .map((s) => s.trim());
