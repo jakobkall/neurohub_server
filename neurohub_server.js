@@ -1,16 +1,12 @@
 /**
- * neurohub_server.js  — v2
- * Node.js + Socket.IO + MySQL2 realtime server
+ * neurohub_server.js — v4
+ * Node.js + Socket.IO + MySQL2
  *
- * Start:  node neurohub_server.js
- * PM2:    pm2 start neurohub_server.js --name neurohub
- *
- * ENV vars (.env eller Railway):
- *   DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_PORT
- *   PORT            (default 3001)
- *   ALLOWED_ORIGINS (komma-separeret, fx "https://jakobkall.com")
+ * Nyheder vs v3:
+ *  - nh_pixels.locked TINYINT — kun admins kan slette låste pixels
+ *  - pixel-event sender { locked } felt
+ *  - state sender [x, y, color, locked] tuples
  */
-
 "use strict";
 
 const http = require("http");
@@ -18,10 +14,11 @@ const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
 require("dotenv").config();
 
-// ── Config ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "https://jakobkall.com")
+const ALLOWED_ORIGINS = (
+  process.env.ALLOWED_ORIGINS ||
+  "https://jakobkall.com,https://hub.jakobkall.com"
+)
   .split(",")
   .map((s) => s.trim());
 
@@ -36,41 +33,41 @@ const DB_CONFIG = {
   charset: "utf8mb4",
 };
 
-// ── Pixel buffer ──────────────────────────────────────────────────────────────
-// Pixels are held in RAM and written to DB in batches.
-// NEVER written one-by-one on each socket event.
-//
-//   pixelBuffer  Map<hubId, Map<"x,y", {x,y,color,user_id,username}>>
-//   erasedKeys   Map<hubId, Set<"x,y">>   — positions deleted since last flush
-//
+// ── RAM buffers ───────────────────────────────────────────────────────────────
+// pixelBuffer: Map<hubId, Map<"x,y", {x,y,color,user_id,username,locked}>>
+// erasedKeys:  Map<hubId, Set<"x,y">>
 const pixelBuffer = new Map();
 const erasedKeys = new Map();
+const bubbleCache = new Map();
+const branchCache = new Map();
+const chatCache = new Map();
+const presence = new Map();
 
-const FLUSH_INTERVAL = 30_000; // 30 seconds
-const FLUSH_BATCH = 500; // also flush when this many pixels are dirty
+const FLUSH_INTERVAL = 30_000;
+const FLUSH_BATCH = 500;
 
-// ── Other RAM caches ──────────────────────────────────────────────────────────
-const bubbleCache = new Map(); // Map<hubId, Map<id, bubble>>
-const branchCache = new Map(); // Map<hubId, Set<"parentId-childId">>
-const chatCache = new Map(); // Map<hubId, Array<msg>>  (last 50)
-const presence = new Map(); // Map<hubId, Map<socketId, {user_id,username,x,y}>>
-
-// ── Bootstrap ─────────────────────────────────────────────────────────────────
 let pool;
 async function bootstrap() {
   pool = await mysql.createPool(DB_CONFIG);
   console.log("[neurohub] DB connected");
+
+  // Ensure locked column exists
+  try {
+    await pool.execute(
+      "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
+    );
+  } catch (e) {
+    /* column may already exist on some MySQL versions */
+  }
 
   await warmUp();
   setInterval(flushAllPixels, FLUSH_INTERVAL);
   startServer();
 }
 
-// ── Warm-up: load existing data from DB into RAM ──────────────────────────────
 async function warmUp() {
-  // Pixels
   const [pixels] = await pool.query(
-    "SELECT hub_id, x, y, color, user_id, username FROM nh_pixels LIMIT 200000",
+    "SELECT hub_id, x, y, color, user_id, username, locked FROM nh_pixels LIMIT 500000",
   );
   pixels.forEach((p) => {
     ensureHubBuffers(p.hub_id);
@@ -78,27 +75,14 @@ async function warmUp() {
   });
   console.log(`[neurohub] Warmed ${pixels.length} pixels`);
 
-  // Bubbles
   const [bubbles] = await pool.query(
     "SELECT id, hub_id, type, x, y, color, content, emotion, emotion_val, user_id, username FROM nh_bubbles",
   );
   bubbles.forEach((b) => {
     ensureHubBuffers(b.hub_id);
-    bubbleCache.get(b.hub_id).set(b.id, {
-      id: b.id,
-      type: b.type,
-      x: b.x,
-      y: b.y,
-      color: b.color,
-      content: b.content,
-      emotion: b.emotion,
-      emotion_val: b.emotion_val,
-      username: b.username,
-      user_id: b.user_id,
-    });
+    bubbleCache.get(b.hub_id).set(b.id, { ...b });
   });
 
-  // Branches
   const [branches] = await pool.query(
     "SELECT hub_id, parent_id, child_id FROM nh_branches",
   );
@@ -107,10 +91,8 @@ async function warmUp() {
     branchCache.get(br.hub_id).add(`${br.parent_id}-${br.child_id}`);
   });
 
-  // Chat (last 50 per hub)
   const [chats] = await pool.query(
-    `SELECT hub_id, username, message, UNIX_TIMESTAMP(created_at) AS ts
-     FROM nh_chat ORDER BY id DESC LIMIT 200`,
+    "SELECT hub_id, username, message, UNIX_TIMESTAMP(created_at) AS ts FROM nh_chat ORDER BY id DESC LIMIT 200",
   );
   chats.reverse().forEach((c) => {
     ensureHubBuffers(c.hub_id);
@@ -118,7 +100,6 @@ async function warmUp() {
       .get(c.hub_id)
       .push({ username: c.username, message: c.message, ts: c.ts });
   });
-
   console.log(
     `[neurohub] Warmed ${bubbles.length} bubbles, ${branches.length} branches`,
   );
@@ -133,37 +114,41 @@ function ensureHubBuffers(hubId) {
   if (!presence.has(hubId)) presence.set(hubId, new Map());
 }
 
-// ── Pixel flush (RAM → DB) ────────────────────────────────────────────────────
+// ── Pixel flush ───────────────────────────────────────────────────────────────
 async function flushPixels(hubId) {
   const buf = pixelBuffer.get(hubId);
   const erased = erasedKeys.get(hubId);
   if ((!buf || buf.size === 0) && (!erased || erased.size === 0)) return;
 
-  // --- Upserts ---
   if (buf && buf.size > 0) {
     const rows = [...buf.values()];
-    const placeholders = rows.map(() => "(?,?,?,?,?,?)").join(",");
+    const placeholders = rows.map(() => "(?,?,?,?,?,?,?)").join(",");
     const vals = [];
     rows.forEach((p) =>
-      vals.push(hubId, p.x, p.y, p.color, p.user_id, p.username),
+      vals.push(
+        hubId,
+        p.x,
+        p.y,
+        p.color,
+        p.user_id,
+        p.username,
+        p.locked ? 1 : 0,
+      ),
     );
     try {
       await pool.execute(
-        `INSERT INTO nh_pixels (hub_id, x, y, color, user_id, username)
+        `INSERT INTO nh_pixels (hub_id, x, y, color, user_id, username, locked)
          VALUES ${placeholders}
          ON DUPLICATE KEY UPDATE
-           color=VALUES(color),
-           user_id=VALUES(user_id),
-           username=VALUES(username)`,
+           color=VALUES(color), user_id=VALUES(user_id),
+           username=VALUES(username), locked=VALUES(locked)`,
         vals,
       );
-      console.log(`[neurohub] Flushed ${rows.length} pixels for hub=${hubId}`);
     } catch (err) {
       console.error("[neurohub] Pixel upsert error:", err.message);
     }
   }
 
-  // --- Deletes (erased pixels) ---
   if (erased && erased.size > 0) {
     for (const key of erased) {
       const [x, y] = key.split(",").map(Number);
@@ -181,18 +166,15 @@ async function flushPixels(hubId) {
 }
 
 async function flushAllPixels() {
-  for (const hubId of pixelBuffer.keys()) {
-    await flushPixels(hubId);
-  }
+  for (const hubId of pixelBuffer.keys()) await flushPixels(hubId);
 }
 
-// ── Build initial state payload for a new client ──────────────────────────────
+// ── State builder ─────────────────────────────────────────────────────────────
 function buildState(hubId) {
   const pixels = [];
   (pixelBuffer.get(hubId) || new Map()).forEach((p) => {
-    pixels.push([p.x, p.y, p.color]);
+    pixels.push([p.x, p.y, p.color, p.locked ? 1 : 0]);
   });
-
   const bubbles = [...(bubbleCache.get(hubId) || new Map()).values()];
   const branches = [];
   (branchCache.get(hubId) || new Set()).forEach((k) => {
@@ -200,11 +182,9 @@ function buildState(hubId) {
     branches.push([p, c]);
   });
   const chat = chatCache.get(hubId) || [];
-
   return { pixels, bubbles, branches, chat };
 }
 
-// ── Presence helpers ──────────────────────────────────────────────────────────
 function getPresence(hubId) {
   return presence.get(hubId) || new Map();
 }
@@ -212,12 +192,12 @@ function presenceList(hubId) {
   return [...getPresence(hubId).values()];
 }
 
-// ── HTTP + Socket.IO ──────────────────────────────────────────────────────────
+// ── Server ────────────────────────────────────────────────────────────────────
 function startServer() {
   const httpServer = http.createServer((req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, ts: Date.now() }));
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
     res.writeHead(404);
@@ -234,42 +214,38 @@ function startServer() {
     pingTimeout: 25_000,
   });
 
-  // ── Auth middleware ──────────────────────────────────────────────────────────
   io.use((socket, next) => {
-    const { user_id, username, hub_id } = socket.handshake.auth || {};
+    const { user_id, username, hub_id, is_admin } = socket.handshake.auth || {};
     if (!user_id || !username) return next(new Error("auth_required"));
     socket.userId = String(user_id);
     socket.username = String(username).substring(0, 64);
     socket.hubId = String(hub_id || "public").substring(0, 64);
+    socket.isAdmin = !!is_admin;
     next();
   });
 
-  // ── Connection ───────────────────────────────────────────────────────────────
   io.on("connection", (socket) => {
-    const { userId, username, hubId } = socket;
-    console.log(`[+] ${username} (${userId}) → hub:${hubId}`);
+    const { userId, username, hubId, isAdmin } = socket;
+    console.log(`[+] ${username} (${userId}) admin=${isAdmin} → hub:${hubId}`);
 
     socket.join(hubId);
     ensureHubBuffers(hubId);
-
-    // Send state to new client
     socket.emit("state", buildState(hubId));
 
-    // Register presence
     getPresence(hubId).set(socket.id, {
       user_id: userId,
       username,
-      x: 1000,
-      y: 700,
+      x: WORLD_W / 2,
+      y: WORLD_H / 2,
     });
     io.to(hubId).emit("presence_list", presenceList(hubId));
 
     // ── PIXEL ────────────────────────────────────────────────────────────────
-    // Pixels go into RAM only. DB write happens in the periodic flush.
     socket.on("pixel", (data) => {
       const x = parseInt(data.x);
       const y = parseInt(data.y);
       const erase = !!data.erase;
+      const locked = !!data.locked && isAdmin; // only admins can lock
       const color = erase
         ? null
         : String(data.color).match(/^#[0-9a-fA-F]{6}$/)
@@ -279,22 +255,31 @@ function startServer() {
       const buf = pixelBuffer.get(hubId);
       const erased = erasedKeys.get(hubId);
       const key = `${x},${y}`;
+      const existing = buf.get(key);
+
+      // Block erase of locked pixels from non-admins
+      if (erase && existing?.locked && !isAdmin) {
+        // Silently deny — client already shows toast
+        return;
+      }
 
       if (erase) {
         buf.delete(key);
-        erased.add(key); // mark for DELETE on next flush
+        erased.add(key);
       } else {
-        erased.delete(key); // no longer needs deleting
-        buf.set(key, { x, y, color, user_id: userId, username });
+        erased.delete(key);
+        buf.set(key, { x, y, color, user_id: userId, username, locked });
       }
 
-      // Broadcast immediately (live update for all clients)
-      io.to(hubId).emit("pixel", { x, y, color: erase ? null : color, erase });
+      io.to(hubId).emit("pixel", {
+        x,
+        y,
+        color: erase ? null : color,
+        erase,
+        locked,
+      });
 
-      // Trigger early flush if buffer is large enough
-      if (buf.size >= FLUSH_BATCH) {
-        flushPixels(hubId).catch(console.error);
-      }
+      if (buf.size >= FLUSH_BATCH) flushPixels(hubId).catch(console.error);
     });
 
     // ── CHAT ─────────────────────────────────────────────────────────────────
@@ -303,35 +288,25 @@ function startServer() {
         .trim()
         .substring(0, 500);
       if (!message) return;
-
       const msg = { username, message, ts: Math.floor(Date.now() / 1000) };
       const cc = chatCache.get(hubId);
       cc.push(msg);
       if (cc.length > 50) cc.shift();
-
       io.to(hubId).emit("chat", msg);
-
       try {
         await pool.execute(
           "INSERT INTO nh_chat (hub_id, user_id, username, message) VALUES (?,?,?,?)",
           [hubId, userId, username, message],
-        );
-        // Trim old chat rows (keep last 200 per hub to avoid unbounded growth)
-        await pool.execute(
-          `DELETE FROM nh_chat WHERE hub_id=? AND id NOT IN (
-             SELECT id FROM (SELECT id FROM nh_chat WHERE hub_id=? ORDER BY id DESC LIMIT 200) t
-           )`,
-          [hubId, hubId],
         );
       } catch (e) {
         console.error("[neurohub] chat db error:", e.message);
       }
     });
 
-    // ── PRESENCE / MOVE ───────────────────────────────────────────────────────
+    // ── MOVE ─────────────────────────────────────────────────────────────────
     socket.on("move", (data) => {
-      const x = parseInt(data.x) || 1000;
-      const y = parseInt(data.y) || 700;
+      const x = parseInt(data.x) || 2000;
+      const y = parseInt(data.y) || 1400;
       const p = getPresence(hubId).get(socket.id);
       if (p) {
         p.x = x;
@@ -340,15 +315,15 @@ function startServer() {
       socket.to(hubId).emit("move", { user_id: userId, username, x, y });
     });
 
-    // ── BUBBLE SAVE (create or update) ───────────────────────────────────────
+    // ── BUBBLE SAVE ───────────────────────────────────────────────────────────
     socket.on("bubble_save", async (data, ack) => {
       const isEdit = !!data.id;
       const type = data.type === "emotion" ? "emotion" : "brain";
       const x = parseInt(data.x) || 100;
       const y = parseInt(data.y) || 100;
-      const color = String(data.color || "#00ffcc").match(/^#[0-9a-fA-F]{6}$/)
+      const color = String(data.color || "#6ee7f7").match(/^#[0-9a-fA-F]{6}$/)
         ? data.color
-        : "#00ffcc";
+        : "#6ee7f7";
       const content =
         type === "brain" ? String(data.content || "").substring(0, 500) : null;
       const emotion =
@@ -362,16 +337,12 @@ function startServer() {
         if (isEdit) {
           bubbleId = parseInt(data.id);
           await pool.execute(
-            `UPDATE nh_bubbles
-             SET x=?, y=?, color=?, content=?, emotion=?, emotion_val=?
-             WHERE id=?`,
+            "UPDATE nh_bubbles SET x=?,y=?,color=?,content=?,emotion=?,emotion_val=? WHERE id=?",
             [x, y, color, content, emotion, emotionVal, bubbleId],
           );
         } else {
           const [res] = await pool.execute(
-            `INSERT INTO nh_bubbles
-               (hub_id, type, x, y, color, content, emotion, emotion_val, user_id, username)
-             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?)",
             [
               hubId,
               type,
@@ -386,13 +357,10 @@ function startServer() {
             ],
           );
           bubbleId = res.insertId;
-
-          // Branch (optional parent link)
           if (data.parent_id) {
             const parentId = parseInt(data.parent_id);
             await pool.execute(
-              `INSERT IGNORE INTO nh_branches (hub_id, parent_id, child_id)
-               VALUES (?,?,?)`,
+              "INSERT IGNORE INTO nh_branches (hub_id,parent_id,child_id) VALUES (?,?,?)",
               [hubId, parentId, bubbleId],
             );
             branchCache.get(hubId).add(`${parentId}-${bubbleId}`);
@@ -402,7 +370,6 @@ function startServer() {
             });
           }
         }
-
         const bubble = {
           id: bubbleId,
           type,
@@ -417,7 +384,6 @@ function startServer() {
         };
         bubbleCache.get(hubId).set(bubbleId, bubble);
         io.to(hubId).emit("bubble_update", bubble);
-
         if (typeof ack === "function") ack({ ok: true, id: bubbleId });
       } catch (e) {
         console.error("[neurohub] bubble_save error:", e.message);
@@ -425,11 +391,11 @@ function startServer() {
       }
     });
 
-    // ── BUBBLE MOVE ──────────────────────────────────────────────────────────
+    // ── BUBBLE MOVE ───────────────────────────────────────────────────────────
     socket.on("bubble_move", async (data) => {
-      const id = parseInt(data.id);
-      const x = parseInt(data.x);
-      const y = parseInt(data.y);
+      const id = parseInt(data.id),
+        x = parseInt(data.x),
+        y = parseInt(data.y);
       const b = bubbleCache.get(hubId)?.get(id);
       if (b) {
         b.x = x;
@@ -437,7 +403,7 @@ function startServer() {
       }
       socket.to(hubId).emit("bubble_moved", { id, x, y });
       try {
-        await pool.execute("UPDATE nh_bubbles SET x=?, y=? WHERE id=?", [
+        await pool.execute("UPDATE nh_bubbles SET x=?,y=? WHERE id=?", [
           x,
           y,
           id,
@@ -447,12 +413,11 @@ function startServer() {
       }
     });
 
-    // ── BUBBLE EDIT (inline text change) ─────────────────────────────────────
+    // ── BUBBLE EDIT ───────────────────────────────────────────────────────────
     socket.on("bubble_edit", async (data) => {
       const id = parseInt(data.id);
       const b = bubbleCache.get(hubId)?.get(id);
       if (!b) return;
-
       if (b.type === "emotion") {
         if (data.emotion !== undefined)
           b.emotion = String(data.emotion).substring(0, 64);
@@ -463,7 +428,7 @@ function startServer() {
           );
         try {
           await pool.execute(
-            "UPDATE nh_bubbles SET emotion=?, emotion_val=? WHERE id=?",
+            "UPDATE nh_bubbles SET emotion=?,emotion_val=? WHERE id=?",
             [b.emotion, b.emotion_val, id],
           );
         } catch (e) {
@@ -481,7 +446,6 @@ function startServer() {
           console.error("[neurohub] bubble_edit brain error:", e.message);
         }
       }
-
       io.to(hubId).emit("bubble_update", b);
     });
 
@@ -507,29 +471,30 @@ function startServer() {
 
     // ── DISCONNECT ────────────────────────────────────────────────────────────
     socket.on("disconnect", () => {
-      console.log(`[-] ${username} (${userId}) ← hub:${hubId}`);
+      console.log(`[-] ${username} ← hub:${hubId}`);
       getPresence(hubId).delete(socket.id);
       io.to(hubId).emit("presence_list", presenceList(hubId));
     });
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] Listening on port ${PORT}`);
+    console.log(`[neurohub] Listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
+const WORLD_W = 4000,
+  WORLD_H = 2800; // for default spawn position
+
 async function shutdown() {
-  console.log("[neurohub] Shutting down — flushing pixels…");
+  console.log("[neurohub] Shutting down…");
   await flushAllPixels();
   process.exit(0);
 }
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-// ── Start ─────────────────────────────────────────────────────────────────────
 bootstrap().catch((err) => {
-  console.error("[neurohub] Fatal bootstrap error:", err);
+  console.error("[neurohub] Fatal:", err);
   process.exit(1);
 });
