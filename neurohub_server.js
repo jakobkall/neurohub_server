@@ -1,14 +1,14 @@
 /**
- * neurohub_server.js
+ * neurohub_server.js  — v2
  * Node.js + Socket.IO + MySQL2 realtime server
  *
  * Start:  node neurohub_server.js
  * PM2:    pm2 start neurohub_server.js --name neurohub
  *
- * ENV vars (sæt i .env eller direkte):
+ * ENV vars (.env eller Railway):
  *   DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_PORT
- *   PORT  (default 3001)
- *   ALLOWED_ORIGINS  (komma-separeret liste, fx "https://jakobkall.com")
+ *   PORT            (default 3001)
+ *   ALLOWED_ORIGINS (komma-separeret, fx "https://jakobkall.com")
  */
 
 "use strict";
@@ -18,184 +18,165 @@ const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
 require("dotenv").config();
 
-// ── Config ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT;
+// ── Config ────────────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3001;
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "https://jakobkall.com")
   .split(",")
   .map((s) => s.trim());
 
 const DB_CONFIG = {
-  host: process.env.DB_HOST || "127.0.0.1",
+  host: process.env.DB_HOST || "mysql48.unoeuro.com",
   port: parseInt(process.env.DB_PORT || "3306"),
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASS || "",
-  database: process.env.DB_NAME || "jakobkall",
+  user: process.env.DB_USER || "jakobkall_com",
+  password: process.env.DB_PASS || "cfDEmaw5n96t",
+  database: process.env.DB_NAME || "jakobkall_com_db_neurohub",
   waitForConnections: true,
   connectionLimit: 10,
   charset: "utf8mb4",
 };
 
-// ── Pixel buffer (RAM) ─────────────────────────────────────────────────────────
-// Structure per hub: Map<hubId, Map<"x,y", {x,y,color,user_id,username}>>
-const pixelBuffer = new Map(); // hub_id -> Map<key, pixel>
-const FLUSH_INTERVAL = 30_000; // 30 sekunder
-const FLUSH_SIZE = 500; // batch-flush ved 500 pixels
+// ── Pixel buffer ──────────────────────────────────────────────────────────────
+// Pixels are held in RAM and written to DB in batches.
+// NEVER written one-by-one on each socket event.
+//
+//   pixelBuffer  Map<hubId, Map<"x,y", {x,y,color,user_id,username}>>
+//   erasedKeys   Map<hubId, Set<"x,y">>   — positions deleted since last flush
+//
+const pixelBuffer = new Map();
+const erasedKeys = new Map();
 
-// ── Bubble cache (RAM kopi til hurtig broadcast) ───────────────────────────────
-// Map<hub_id, Map<id, bubble>>
-const bubbleCache = new Map();
-const branchCache = new Map(); // Map<hub_id, Set<"parentId-childId">>
+const FLUSH_INTERVAL = 30_000; // 30 seconds
+const FLUSH_BATCH = 500; // also flush when this many pixels are dirty
 
-// ── Chat history per hub (seneste 50) ─────────────────────────────────────────
-const chatCache = new Map(); // Map<hub_id, Array>
+// ── Other RAM caches ──────────────────────────────────────────────────────────
+const bubbleCache = new Map(); // Map<hubId, Map<id, bubble>>
+const branchCache = new Map(); // Map<hubId, Set<"parentId-childId">>
+const chatCache = new Map(); // Map<hubId, Array<msg>>  (last 50)
+const presence = new Map(); // Map<hubId, Map<socketId, {user_id,username,x,y}>>
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 let pool;
 async function bootstrap() {
   pool = await mysql.createPool(DB_CONFIG);
+  console.log("[neurohub] DB connected");
 
-  // Opret tabel hvis den mangler
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS neurohub (
-      id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-      hub_id      VARCHAR(64)  NOT NULL DEFAULT 'public',
-      type        ENUM('pixel','chat','bubble','presence','branch') NOT NULL,
-      user_id     BIGINT       NOT NULL,
-      username    VARCHAR(64)  NOT NULL,
-      x           INT          DEFAULT NULL,
-      y           INT          DEFAULT NULL,
-      color       VARCHAR(7)   DEFAULT NULL,
-      content     TEXT         DEFAULT NULL,
-      extra_type  VARCHAR(32)  DEFAULT NULL,
-      parent_id   BIGINT UNSIGNED DEFAULT NULL,
-      child_id    BIGINT UNSIGNED DEFAULT NULL,
-      created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY idx_pixel_pos (hub_id, type, x, y)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
-
-  console.log("[neurohub] DB connected & table ready");
-
-  // Forvarm RAM med eksisterende data fra DB
   await warmUp();
-
-  // Start flush-timer
-  setInterval(() => flushAllPixels(), FLUSH_INTERVAL);
-
+  setInterval(flushAllPixels, FLUSH_INTERVAL);
   startServer();
 }
 
-// ── Warm-up: Indlæs eksisterende data fra DB i RAM ───────────────────────────
+// ── Warm-up: load existing data from DB into RAM ──────────────────────────────
 async function warmUp() {
   // Pixels
   const [pixels] = await pool.query(
-    "SELECT hub_id, x, y, color, user_id, username FROM neurohub WHERE type='pixel' LIMIT 100000",
+    "SELECT hub_id, x, y, color, user_id, username FROM nh_pixels LIMIT 200000",
   );
   pixels.forEach((p) => {
-    if (!pixelBuffer.has(p.hub_id)) pixelBuffer.set(p.hub_id, new Map());
+    ensureHubBuffers(p.hub_id);
     pixelBuffer.get(p.hub_id).set(`${p.x},${p.y}`, p);
   });
-  console.log(`[neurohub] Warmed up ${pixels.length} pixels`);
+  console.log(`[neurohub] Warmed ${pixels.length} pixels`);
 
   // Bubbles
   const [bubbles] = await pool.query(
-    "SELECT id, hub_id, x, y, color, content, extra_type, user_id, username FROM neurohub WHERE type='bubble'",
+    "SELECT id, hub_id, type, x, y, color, content, emotion, emotion_val, user_id, username FROM nh_bubbles",
   );
   bubbles.forEach((b) => {
-    if (!bubbleCache.has(b.hub_id)) bubbleCache.set(b.hub_id, new Map());
+    ensureHubBuffers(b.hub_id);
     bubbleCache.get(b.hub_id).set(b.id, {
       id: b.id,
-      type: b.extra_type || "brain",
+      type: b.type,
       x: b.x,
       y: b.y,
       color: b.color,
       content: b.content,
-      emotion: null,
-      emotion_val: null,
+      emotion: b.emotion,
+      emotion_val: b.emotion_val,
       username: b.username,
       user_id: b.user_id,
     });
   });
 
-  // Emotion-felter gemmes i content som JSON for følelse-bobler
-  // (ekstra_type = 'emotion', content = JSON-streng)
-  bubbleCache.forEach((hMap) => {
-    hMap.forEach((b, id) => {
-      if (b.type === "emotion" && b.content) {
-        try {
-          const parsed = JSON.parse(b.content);
-          b.emotion = parsed.emotion || null;
-          b.emotion_val = parsed.emotion_val || null;
-          b.content = null;
-        } catch (e) {}
-      }
-    });
-  });
-
   // Branches
   const [branches] = await pool.query(
-    "SELECT hub_id, parent_id, child_id FROM neurohub WHERE type='branch'",
+    "SELECT hub_id, parent_id, child_id FROM nh_branches",
   );
   branches.forEach((br) => {
-    if (!branchCache.has(br.hub_id)) branchCache.set(br.hub_id, new Set());
+    ensureHubBuffers(br.hub_id);
     branchCache.get(br.hub_id).add(`${br.parent_id}-${br.child_id}`);
   });
 
-  // Chat (seneste 50 per hub)
+  // Chat (last 50 per hub)
   const [chats] = await pool.query(
-    "SELECT hub_id, username, content AS message, UNIX_TIMESTAMP(created_at) AS ts FROM neurohub WHERE type='chat' ORDER BY id DESC LIMIT 50",
+    `SELECT hub_id, username, message, UNIX_TIMESTAMP(created_at) AS ts
+     FROM nh_chat ORDER BY id DESC LIMIT 200`,
   );
   chats.reverse().forEach((c) => {
-    if (!chatCache.has(c.hub_id)) chatCache.set(c.hub_id, []);
+    ensureHubBuffers(c.hub_id);
     chatCache
       .get(c.hub_id)
       .push({ username: c.username, message: c.message, ts: c.ts });
   });
 
   console.log(
-    `[neurohub] Warmed up ${bubbles.length} bubbles, ${branches.length} branches`,
+    `[neurohub] Warmed ${bubbles.length} bubbles, ${branches.length} branches`,
   );
 }
 
-// ── Pixel buffer flush ────────────────────────────────────────────────────────
+function ensureHubBuffers(hubId) {
+  if (!pixelBuffer.has(hubId)) pixelBuffer.set(hubId, new Map());
+  if (!erasedKeys.has(hubId)) erasedKeys.set(hubId, new Set());
+  if (!bubbleCache.has(hubId)) bubbleCache.set(hubId, new Map());
+  if (!branchCache.has(hubId)) branchCache.set(hubId, new Set());
+  if (!chatCache.has(hubId)) chatCache.set(hubId, []);
+  if (!presence.has(hubId)) presence.set(hubId, new Map());
+}
+
+// ── Pixel flush (RAM → DB) ────────────────────────────────────────────────────
 async function flushPixels(hubId) {
   const buf = pixelBuffer.get(hubId);
-  if (!buf || buf.size === 0) return;
+  const erased = erasedKeys.get(hubId);
+  if ((!buf || buf.size === 0) && (!erased || erased.size === 0)) return;
 
-  // Tag et snapshot og tøm bufferen med det samme (thread-safe nok for Node.js)
-  const rows = [...buf.values()];
-
-  try {
-    // Bulk INSERT – ON DUPLICATE KEY UPDATE
-    const placeholders = rows.map(() => "(?,?,?,?,?,?,?)").join(",");
+  // --- Upserts ---
+  if (buf && buf.size > 0) {
+    const rows = [...buf.values()];
+    const placeholders = rows.map(() => "(?,?,?,?,?,?)").join(",");
     const vals = [];
-    rows.forEach((p) => {
-      vals.push(hubId, "pixel", p.user_id, p.username, p.x, p.y, p.color);
-    });
-
-    await pool.execute(
-      `INSERT INTO neurohub (hub_id, type, user_id, username, x, y, color)
-       VALUES ${placeholders}
-       ON DUPLICATE KEY UPDATE color=VALUES(color), user_id=VALUES(user_id), username=VALUES(username)`,
-      vals,
+    rows.forEach((p) =>
+      vals.push(hubId, p.x, p.y, p.color, p.user_id, p.username),
     );
+    try {
+      await pool.execute(
+        `INSERT INTO nh_pixels (hub_id, x, y, color, user_id, username)
+         VALUES ${placeholders}
+         ON DUPLICATE KEY UPDATE
+           color=VALUES(color),
+           user_id=VALUES(user_id),
+           username=VALUES(username)`,
+        vals,
+      );
+      console.log(`[neurohub] Flushed ${rows.length} pixels for hub=${hubId}`);
+    } catch (err) {
+      console.error("[neurohub] Pixel upsert error:", err.message);
+    }
+  }
 
-    // Håndter sletninger (color = '__erase__' markering)
-    const toDelete = rows.filter((p) => p.color === "__erase__");
-    if (toDelete.length) {
-      for (const p of toDelete) {
+  // --- Deletes (erased pixels) ---
+  if (erased && erased.size > 0) {
+    for (const key of erased) {
+      const [x, y] = key.split(",").map(Number);
+      try {
         await pool.execute(
-          "DELETE FROM neurohub WHERE hub_id=? AND type='pixel' AND x=? AND y=?",
-          [hubId, p.x, p.y],
+          "DELETE FROM nh_pixels WHERE hub_id=? AND x=? AND y=?",
+          [hubId, x, y],
         );
-        buf.delete(`${p.x},${p.y}`);
+      } catch (err) {
+        console.error("[neurohub] Pixel delete error:", err.message);
       }
     }
-
-    console.log(`[neurohub] Flushed ${rows.length} pixels for hub=${hubId}`);
-  } catch (err) {
-    console.error("[neurohub] Pixel flush error:", err.message);
+    erased.clear();
   }
 }
 
@@ -205,54 +186,35 @@ async function flushAllPixels() {
   }
 }
 
-function ensureHubBuffers(hubId) {
-  if (!pixelBuffer.has(hubId)) pixelBuffer.set(hubId, new Map());
-  if (!bubbleCache.has(hubId)) bubbleCache.set(hubId, new Map());
-  if (!branchCache.has(hubId)) branchCache.set(hubId, new Set());
-  if (!chatCache.has(hubId)) chatCache.set(hubId, []);
-}
-
-// ── Byg initial state til ny klient ───────────────────────────────────────────
+// ── Build initial state payload for a new client ──────────────────────────────
 function buildState(hubId) {
   const pixels = [];
-  const buf = pixelBuffer.get(hubId) || new Map();
-  buf.forEach((p, key) => {
-    if (p.color !== "__erase__") {
-      pixels.push([p.x, p.y, p.color]);
-    }
+  (pixelBuffer.get(hubId) || new Map()).forEach((p) => {
+    pixels.push([p.x, p.y, p.color]);
   });
 
-  const bubbles = [];
-  (bubbleCache.get(hubId) || new Map()).forEach((b) => bubbles.push(b));
-
+  const bubbles = [...(bubbleCache.get(hubId) || new Map()).values()];
   const branches = [];
   (branchCache.get(hubId) || new Set()).forEach((k) => {
     const [p, c] = k.split("-").map(Number);
     branches.push([p, c]);
   });
-
   const chat = chatCache.get(hubId) || [];
 
   return { pixels, bubbles, branches, chat };
 }
 
-// ── Online presence (kun RAM) ─────────────────────────────────────────────────
-// Map<hub_id, Map<socket.id, {user_id, username, x, y}>>
-const presence = new Map();
-
-function getHubPresence(hubId) {
-  if (!presence.has(hubId)) presence.set(hubId, new Map());
-  return presence.get(hubId);
+// ── Presence helpers ──────────────────────────────────────────────────────────
+function getPresence(hubId) {
+  return presence.get(hubId) || new Map();
 }
-
 function presenceList(hubId) {
-  return [...getHubPresence(hubId).values()];
+  return [...getPresence(hubId).values()];
 }
 
-// ── HTTP + Socket.IO server ───────────────────────────────────────────────────
+// ── HTTP + Socket.IO ──────────────────────────────────────────────────────────
 function startServer() {
   const httpServer = http.createServer((req, res) => {
-    // Simpel health-check endpoint
     if (req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, ts: Date.now() }));
@@ -272,35 +234,29 @@ function startServer() {
     pingTimeout: 25_000,
   });
 
-  // ── Socket middleware: token-auth ───────────────────────────────────────────
-  // Klienten sender { user_id, username, hub_id, token } i handshake.auth
-  // Token valideres ikke kryptografisk her – PHP-sessionen bør have gjort det.
-  // Men du KAN tilføje et HMAC-tjek her senere.
+  // ── Auth middleware ──────────────────────────────────────────────────────────
   io.use((socket, next) => {
     const { user_id, username, hub_id } = socket.handshake.auth || {};
-    if (!user_id || !username) {
-      return next(new Error("auth_required"));
-    }
+    if (!user_id || !username) return next(new Error("auth_required"));
     socket.userId = String(user_id);
     socket.username = String(username).substring(0, 64);
     socket.hubId = String(hub_id || "public").substring(0, 64);
     next();
   });
 
-  // ── Connection ─────────────────────────────────────────────────────────────
+  // ── Connection ───────────────────────────────────────────────────────────────
   io.on("connection", (socket) => {
     const { userId, username, hubId } = socket;
-
     console.log(`[+] ${username} (${userId}) → hub:${hubId}`);
 
     socket.join(hubId);
     ensureHubBuffers(hubId);
 
-    // 1. Send initial state
+    // Send state to new client
     socket.emit("state", buildState(hubId));
 
-    // 2. Registrér presence
-    getHubPresence(hubId).set(socket.id, {
+    // Register presence
+    getPresence(hubId).set(socket.id, {
       user_id: userId,
       username,
       x: 1000,
@@ -309,29 +265,34 @@ function startServer() {
     io.to(hubId).emit("presence_list", presenceList(hubId));
 
     // ── PIXEL ────────────────────────────────────────────────────────────────
+    // Pixels go into RAM only. DB write happens in the periodic flush.
     socket.on("pixel", (data) => {
-      // data: { x, y, color }  eller { x, y, erase: true }
       const x = parseInt(data.x);
       const y = parseInt(data.y);
       const erase = !!data.erase;
       const color = erase
-        ? "__erase__"
+        ? null
         : String(data.color).match(/^#[0-9a-fA-F]{6}$/)
           ? data.color
           : "#ffffff";
 
       const buf = pixelBuffer.get(hubId);
+      const erased = erasedKeys.get(hubId);
+      const key = `${x},${y}`;
+
       if (erase) {
-        buf.delete(`${x},${y}`);
+        buf.delete(key);
+        erased.add(key); // mark for DELETE on next flush
       } else {
-        buf.set(`${x},${y}`, { x, y, color, user_id: userId, username });
+        erased.delete(key); // no longer needs deleting
+        buf.set(key, { x, y, color, user_id: userId, username });
       }
 
-      // Broadcast live til alle i hubben
+      // Broadcast immediately (live update for all clients)
       io.to(hubId).emit("pixel", { x, y, color: erase ? null : color, erase });
 
-      // Flush ved batch-størrelse
-      if (buf.size >= FLUSH_SIZE) {
+      // Trigger early flush if buffer is large enough
+      if (buf.size >= FLUSH_BATCH) {
         flushPixels(hubId).catch(console.error);
       }
     });
@@ -340,45 +301,46 @@ function startServer() {
     socket.on("chat", async (data) => {
       const message = String(data.message || "")
         .trim()
-        .substring(0, 200);
+        .substring(0, 500);
       if (!message) return;
 
       const msg = { username, message, ts: Math.floor(Date.now() / 1000) };
-
-      // Gem i chat-cache
       const cc = chatCache.get(hubId);
       cc.push(msg);
       if (cc.length > 50) cc.shift();
 
-      // Broadcast
       io.to(hubId).emit("chat", msg);
 
-      // Skriv til DB async (chat er ikke buffered – gemmes straks)
       try {
         await pool.execute(
-          "INSERT INTO neurohub (hub_id, type, user_id, username, content) VALUES (?,?,?,?,?)",
-          [hubId, "chat", userId, username, message],
+          "INSERT INTO nh_chat (hub_id, user_id, username, message) VALUES (?,?,?,?)",
+          [hubId, userId, username, message],
+        );
+        // Trim old chat rows (keep last 200 per hub to avoid unbounded growth)
+        await pool.execute(
+          `DELETE FROM nh_chat WHERE hub_id=? AND id NOT IN (
+             SELECT id FROM (SELECT id FROM nh_chat WHERE hub_id=? ORDER BY id DESC LIMIT 200) t
+           )`,
+          [hubId, hubId],
         );
       } catch (e) {
         console.error("[neurohub] chat db error:", e.message);
       }
     });
 
-    // ── PRESENCE (bevægelse) – KUN live, gemmes ALDRIG ────────────────────
+    // ── PRESENCE / MOVE ───────────────────────────────────────────────────────
     socket.on("move", (data) => {
       const x = parseInt(data.x) || 1000;
       const y = parseInt(data.y) || 700;
-      const pMap = getHubPresence(hubId);
-      const p = pMap.get(socket.id);
+      const p = getPresence(hubId).get(socket.id);
       if (p) {
         p.x = x;
         p.y = y;
       }
-      // Broadcast kun til andre i hubben (ikke afsender)
       socket.to(hubId).emit("move", { user_id: userId, username, x, y });
     });
 
-    // ── BUBBLE OPRET / OPDATER ────────────────────────────────────────────
+    // ── BUBBLE SAVE (create or update) ───────────────────────────────────────
     socket.on("bubble_save", async (data, ack) => {
       const isEdit = !!data.id;
       const type = data.type === "emotion" ? "emotion" : "brain";
@@ -388,39 +350,51 @@ function startServer() {
         ? data.color
         : "#00ffcc";
       const content =
-        type === "brain"
-          ? String(data.content || "").substring(0, 500)
-          : JSON.stringify({
-              emotion: String(data.emotion || "").substring(0, 64),
-              emotion_val: Math.min(
-                10,
-                Math.max(1, parseInt(data.emotion_val) || 5),
-              ),
-            });
-
+        type === "brain" ? String(data.content || "").substring(0, 500) : null;
+      const emotion =
+        type === "emotion" ? String(data.emotion || "").substring(0, 64) : null;
+      const emotionVal =
+        type === "emotion"
+          ? Math.min(10, Math.max(1, parseInt(data.emotion_val) || 5))
+          : null;
       try {
         let bubbleId;
         if (isEdit) {
           bubbleId = parseInt(data.id);
           await pool.execute(
-            "UPDATE neurohub SET x=?, y=?, color=?, content=? WHERE id=? AND type='bubble'",
-            [x, y, color, content, bubbleId],
+            `UPDATE nh_bubbles
+             SET x=?, y=?, color=?, content=?, emotion=?, emotion_val=?
+             WHERE id=?`,
+            [x, y, color, content, emotion, emotionVal, bubbleId],
           );
         } else {
           const [res] = await pool.execute(
-            "INSERT INTO neurohub (hub_id, type, user_id, username, x, y, color, content, extra_type) VALUES (?,?,?,?,?,?,?,?,?)",
-            [hubId, "bubble", userId, username, x, y, color, content, type],
+            `INSERT INTO nh_bubbles
+               (hub_id, type, x, y, color, content, emotion, emotion_val, user_id, username)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+            [
+              hubId,
+              type,
+              x,
+              y,
+              color,
+              content,
+              emotion,
+              emotionVal,
+              userId,
+              username,
+            ],
           );
           bubbleId = res.insertId;
 
-          // Branch
+          // Branch (optional parent link)
           if (data.parent_id) {
             const parentId = parseInt(data.parent_id);
             await pool.execute(
-              "INSERT IGNORE INTO neurohub (hub_id, type, user_id, username, parent_id, child_id) VALUES (?,?,?,?,?,?)",
-              [hubId, "branch", userId, username, parentId, bubbleId],
+              `INSERT IGNORE INTO nh_branches (hub_id, parent_id, child_id)
+               VALUES (?,?,?)`,
+              [hubId, parentId, bubbleId],
             );
-            if (!branchCache.has(hubId)) branchCache.set(hubId, new Set());
             branchCache.get(hubId).add(`${parentId}-${bubbleId}`);
             io.to(hubId).emit("branch_add", {
               parent_id: parentId,
@@ -429,33 +403,19 @@ function startServer() {
           }
         }
 
-        // Opdater cache
-        const bMap = bubbleCache.get(hubId);
-        const parsedContent = type === "emotion" ? null : content;
-        let emotion = null,
-          emotion_val = null;
-        if (type === "emotion") {
-          try {
-            const j = JSON.parse(content);
-            emotion = j.emotion;
-            emotion_val = j.emotion_val;
-          } catch (e) {}
-        }
         const bubble = {
           id: bubbleId,
           type,
           x,
           y,
           color,
-          content: parsedContent,
+          content,
           emotion,
-          emotion_val,
+          emotion_val: emotionVal,
           username,
           user_id: userId,
         };
-        bMap.set(bubbleId, bubble);
-
-        // Broadcast
+        bubbleCache.get(hubId).set(bubbleId, bubble);
         io.to(hubId).emit("bubble_update", bubble);
 
         if (typeof ack === "function") ack({ ok: true, id: bubbleId });
@@ -465,29 +425,67 @@ function startServer() {
       }
     });
 
-    // ── BUBBLE FLYT ──────────────────────────────────────────────────────────
+    // ── BUBBLE MOVE ──────────────────────────────────────────────────────────
     socket.on("bubble_move", async (data) => {
       const id = parseInt(data.id);
       const x = parseInt(data.x);
       const y = parseInt(data.y);
-      const bMap = bubbleCache.get(hubId);
-      const b = bMap?.get(id);
+      const b = bubbleCache.get(hubId)?.get(id);
       if (b) {
         b.x = x;
         b.y = y;
       }
       socket.to(hubId).emit("bubble_moved", { id, x, y });
       try {
-        await pool.execute(
-          "UPDATE neurohub SET x=?, y=? WHERE id=? AND type='bubble'",
-          [x, y, id],
-        );
+        await pool.execute("UPDATE nh_bubbles SET x=?, y=? WHERE id=?", [
+          x,
+          y,
+          id,
+        ]);
       } catch (e) {
         console.error("[neurohub] bubble_move error:", e.message);
       }
     });
 
-    // ── BUBBLE SLET ───────────────────────────────────────────────────────────
+    // ── BUBBLE EDIT (inline text change) ─────────────────────────────────────
+    socket.on("bubble_edit", async (data) => {
+      const id = parseInt(data.id);
+      const b = bubbleCache.get(hubId)?.get(id);
+      if (!b) return;
+
+      if (b.type === "emotion") {
+        if (data.emotion !== undefined)
+          b.emotion = String(data.emotion).substring(0, 64);
+        if (data.emotion_val !== undefined)
+          b.emotion_val = Math.min(
+            10,
+            Math.max(1, parseInt(data.emotion_val) || 5),
+          );
+        try {
+          await pool.execute(
+            "UPDATE nh_bubbles SET emotion=?, emotion_val=? WHERE id=?",
+            [b.emotion, b.emotion_val, id],
+          );
+        } catch (e) {
+          console.error("[neurohub] bubble_edit emotion error:", e.message);
+        }
+      } else {
+        if (data.content !== undefined)
+          b.content = String(data.content).substring(0, 500);
+        try {
+          await pool.execute("UPDATE nh_bubbles SET content=? WHERE id=?", [
+            b.content,
+            id,
+          ]);
+        } catch (e) {
+          console.error("[neurohub] bubble_edit brain error:", e.message);
+        }
+      }
+
+      io.to(hubId).emit("bubble_update", b);
+    });
+
+    // ── BUBBLE DELETE ─────────────────────────────────────────────────────────
     socket.on("bubble_delete", async (data) => {
       const id = parseInt(data.id);
       bubbleCache.get(hubId)?.delete(id);
@@ -497,12 +495,9 @@ function startServer() {
       });
       io.to(hubId).emit("bubble_delete", { id });
       try {
+        await pool.execute("DELETE FROM nh_bubbles WHERE id=?", [id]);
         await pool.execute(
-          "DELETE FROM neurohub WHERE id=? AND type='bubble'",
-          [id],
-        );
-        await pool.execute(
-          "DELETE FROM neurohub WHERE type='branch' AND (parent_id=? OR child_id=?)",
+          "DELETE FROM nh_branches WHERE parent_id=? OR child_id=?",
           [id, id],
         );
       } catch (e) {
@@ -510,61 +505,28 @@ function startServer() {
       }
     });
 
-    // ── BUBBLE EDIT (inline tekst) ────────────────────────────────────────────
-    socket.on("bubble_edit", async (data) => {
-      const id = parseInt(data.id);
-      const bMap = bubbleCache.get(hubId);
-      const b = bMap?.get(id);
-      if (!b) return;
-
-      let content;
-      if (b.type === "emotion") {
-        b.emotion = String(data.emotion || b.emotion || "").substring(0, 64);
-        b.emotion_val = parseInt(data.emotion_val ?? b.emotion_val ?? 5);
-        content = JSON.stringify({
-          emotion: b.emotion,
-          emotion_val: b.emotion_val,
-        });
-      } else {
-        b.content = String(data.content || "").substring(0, 500);
-        content = b.content;
-      }
-      io.to(hubId).emit("bubble_update", b);
-      try {
-        await pool.execute(
-          "UPDATE neurohub SET content=? WHERE id=? AND type='bubble'",
-          [content, id],
-        );
-      } catch (e) {
-        console.error("[neurohub] bubble_edit error:", e.message);
-      }
-    });
-
     // ── DISCONNECT ────────────────────────────────────────────────────────────
     socket.on("disconnect", () => {
       console.log(`[-] ${username} (${userId}) ← hub:${hubId}`);
-      getHubPresence(hubId).delete(socket.id);
+      getPresence(hubId).delete(socket.id);
       io.to(hubId).emit("presence_list", presenceList(hubId));
     });
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] Server kører på port ${PORT}`);
-    console.log(`[neurohub] CORS tillader: ${ALLOWED_ORIGINS.join(", ")}`);
+    console.log(`[neurohub] Listening on port ${PORT}`);
+    console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
-process.on("SIGTERM", async () => {
-  console.log("[neurohub] SIGTERM – flusher pixels og lukker…");
+async function shutdown() {
+  console.log("[neurohub] Shutting down — flushing pixels…");
   await flushAllPixels();
   process.exit(0);
-});
-process.on("SIGINT", async () => {
-  console.log("[neurohub] SIGINT – flusher pixels og lukker…");
-  await flushAllPixels();
-  process.exit(0);
-});
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 bootstrap().catch((err) => {
