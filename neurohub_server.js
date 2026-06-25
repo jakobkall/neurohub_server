@@ -1,15 +1,12 @@
 /**
- * neurohub_server.js — v4.1
+ * neurohub_server.js — v4.3
  *
- * Fixes vs v4:
- *  - nh_pixels UPSERT now uses correct unique key assumption; falls back to
- *    DELETE+INSERT if ON DUPLICATE KEY fails (handles missing UNIQUE index)
- *  - Added SQL to ensure UNIQUE INDEX on (hub_id,x,y) at startup
- *  - users table lookup uses correct PK column `id` not `user_id`
- *  - is_admin resolved server-side from DB, not trusted from client auth
- *  - presence_list now always broadcasts on join/leave
- *  - warmUp correctly maps nh_pixels locked column
- *  - pixel event emission fixed: always emits to all including sender
+ * Changes vs v4.1:
+ *  - Admin zones: nh_admin_zones table, zone_add / zone_delete / zones events
+ *  - buildState() includes zones array
+ *  - zone server-side enforcement: pixel events blocked inside locked zones for non-admins
+ *  - admin is resolved server-side from DB (both id and user_id columns checked)
+ *  - users table: user_type may be "admin, therapist" — splits on comma
  */
 "use strict";
 
@@ -37,19 +34,20 @@ const DB_CONFIG = {
   charset: "utf8mb4",
 };
 
-// ── RAM buffers ───────────────────────────────────────────────────────────────
-const pixelBuffer = new Map(); // hubId → Map<"x,y", {x,y,color,user_id,username,locked}>
+// ── RAM caches ────────────────────────────────────────────────────────────────
+const pixelBuffer = new Map(); // hubId → Map<"x,y", pixel>
 const erasedKeys = new Map(); // hubId → Set<"x,y">
 const bubbleCache = new Map(); // hubId → Map<id, bubble>
-const branchCache = new Map(); // hubId → Set<"parentId-childId">
-const chatCache = new Map(); // hubId → [{username,message,ts}]
-const presence = new Map(); // hubId → Map<socketId, {user_id,username,x,y}>
+const branchCache = new Map(); // hubId → Set<"p-c">
+const chatCache = new Map(); // hubId → [msg]
+const presence = new Map(); // hubId → Map<socketId, user>
+const zoneCache = new Map(); // hubId → Map<id, zone>
+const adminCache = new Map(); // userId → bool
 
-// adminCache: user_id (string) → boolean
-const adminCache = new Map();
-
-const FLUSH_INTERVAL = 20_000; // flush every 20s
-const FLUSH_BATCH = 200; // also flush when buffer hits this size
+const FLUSH_INTERVAL = 20_000;
+const FLUSH_BATCH = 200;
+const WORLD_W = 4000,
+  WORLD_H = 2800;
 
 let pool;
 
@@ -58,42 +56,51 @@ async function bootstrap() {
   pool = await mysql.createPool(DB_CONFIG);
   console.log("[neurohub] DB connected");
 
-  // Ensure locked column exists on nh_pixels
+  // Ensure locked column on pixels
   try {
     await pool.execute(
       "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
     );
-  } catch (e) {
-    /* ignore — column may already exist */
-  }
+  } catch (e) {}
 
-  // Ensure UNIQUE index so ON DUPLICATE KEY UPDATE works
+  // Ensure UNIQUE index on pixels
   try {
     await pool.execute(
-      "ALTER TABLE nh_pixels ADD UNIQUE INDEX IF NOT EXISTS ux_hub_xy (hub_id, x, y)",
+      "ALTER TABLE nh_pixels ADD UNIQUE INDEX IF NOT EXISTS ux_hub_xy (hub_id,x,y)",
     );
-    console.log("[neurohub] UNIQUE index on nh_pixels ensured");
   } catch (e) {
-    // MySQL 5.x doesn't support IF NOT EXISTS on indexes; try without
     try {
       await pool.execute(
-        "ALTER TABLE nh_pixels ADD UNIQUE INDEX ux_hub_xy (hub_id, x, y)",
+        "ALTER TABLE nh_pixels ADD UNIQUE INDEX ux_hub_xy (hub_id,x,y)",
       );
-    } catch (e2) {
-      /* already exists */
-    }
+    } catch (e2) {}
   }
+
+  // Create admin zones table if missing
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS nh_admin_zones (
+      id       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      hub_id   VARCHAR(64) NOT NULL DEFAULT 'public',
+      x        INT NOT NULL,
+      y        INT NOT NULL,
+      w        INT NOT NULL,
+      h        INT NOT NULL,
+      label    VARCHAR(64) DEFAULT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_hub (hub_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  console.log("[neurohub] nh_admin_zones table ensured");
 
   await warmUp();
   setInterval(flushAllPixels, FLUSH_INTERVAL);
   startServer();
 }
 
-// ── Warm-up: load all state into RAM ──────────────────────────────────────────
+// ── Warm-up ───────────────────────────────────────────────────────────────────
 async function warmUp() {
-  // Pixels
   const [pixels] = await pool.query(
-    "SELECT hub_id, x, y, color, user_id, username, IFNULL(locked,0) AS locked FROM nh_pixels LIMIT 500000",
+    "SELECT hub_id,x,y,color,user_id,username,IFNULL(locked,0) AS locked FROM nh_pixels LIMIT 500000",
   );
   pixels.forEach((p) => {
     ensureHubBuffers(p.hub_id);
@@ -108,27 +115,24 @@ async function warmUp() {
   });
   console.log(`[neurohub] Warmed ${pixels.length} pixels`);
 
-  // Bubbles
   const [bubbles] = await pool.query(
-    "SELECT id, hub_id, type, x, y, color, content, emotion, emotion_val, user_id, username FROM nh_bubbles",
+    "SELECT id,hub_id,type,x,y,color,content,emotion,emotion_val,user_id,username FROM nh_bubbles",
   );
   bubbles.forEach((b) => {
     ensureHubBuffers(b.hub_id);
     bubbleCache.get(b.hub_id).set(b.id, { ...b });
   });
 
-  // Branches
   const [branches] = await pool.query(
-    "SELECT hub_id, parent_id, child_id FROM nh_branches",
+    "SELECT hub_id,parent_id,child_id FROM nh_branches",
   );
   branches.forEach((br) => {
     ensureHubBuffers(br.hub_id);
     branchCache.get(br.hub_id).add(`${br.parent_id}-${br.child_id}`);
   });
 
-  // Chat (last 50 per hub)
   const [chats] = await pool.query(
-    "SELECT hub_id, username, message, UNIX_TIMESTAMP(created_at) AS ts FROM nh_chat ORDER BY id DESC LIMIT 500",
+    "SELECT hub_id,username,message,UNIX_TIMESTAMP(created_at) AS ts FROM nh_chat ORDER BY id DESC LIMIT 500",
   );
   chats.reverse().forEach((c) => {
     ensureHubBuffers(c.hub_id);
@@ -137,12 +141,25 @@ async function warmUp() {
     if (cc.length > 50) cc.shift();
   });
 
+  const [zones] = await pool.query(
+    "SELECT id,hub_id,x,y,w,h,label FROM nh_admin_zones",
+  );
+  zones.forEach((z) => {
+    ensureHubBuffers(z.hub_id);
+    zoneCache.get(z.hub_id).set(z.id, {
+      id: z.id,
+      x: z.x,
+      y: z.y,
+      w: z.w,
+      h: z.h,
+      label: z.label || "",
+    });
+  });
   console.log(
-    `[neurohub] Warmed ${bubbles.length} bubbles, ${branches.length} branches, ${chats.length} chat msgs`,
+    `[neurohub] Warmed ${bubbles.length} bubbles, ${zones.length} zones`,
   );
 }
 
-// ── Hub buffer init ───────────────────────────────────────────────────────────
 function ensureHubBuffers(hubId) {
   if (!pixelBuffer.has(hubId)) pixelBuffer.set(hubId, new Map());
   if (!erasedKeys.has(hubId)) erasedKeys.set(hubId, new Set());
@@ -150,19 +167,16 @@ function ensureHubBuffers(hubId) {
   if (!branchCache.has(hubId)) branchCache.set(hubId, new Set());
   if (!chatCache.has(hubId)) chatCache.set(hubId, []);
   if (!presence.has(hubId)) presence.set(hubId, new Map());
+  if (!zoneCache.has(hubId)) zoneCache.set(hubId, new Map());
 }
 
-// ── Admin lookup ──────────────────────────────────────────────────────────────
-// The users table PK is `id` (int), but session stores user_id which maps to
-// the `user_id` bigint column OR the `id` column depending on auth method.
-// We try both to be safe.
+// ── Admin check ───────────────────────────────────────────────────────────────
 async function resolveAdmin(userId) {
   const key = String(userId);
   if (adminCache.has(key)) return adminCache.get(key);
   try {
-    // Try matching on `id` first (the actual PK), then `user_id` column
     const [rows] = await pool.execute(
-      "SELECT user_type FROM users WHERE id = ? OR user_id = ? LIMIT 1",
+      "SELECT user_type FROM users WHERE id=? OR user_id=? LIMIT 1",
       [userId, userId],
     );
     if (rows.length) {
@@ -174,9 +188,19 @@ async function resolveAdmin(userId) {
       return isAdmin;
     }
   } catch (e) {
-    console.error("[neurohub] admin lookup error:", e.message);
+    console.error("[neurohub] admin lookup:", e.message);
   }
   adminCache.set(key, false);
+  return false;
+}
+
+// ── Zone helpers ──────────────────────────────────────────────────────────────
+function isInLockedZone(hubId, cx, cy) {
+  const zones = zoneCache.get(hubId);
+  if (!zones) return false;
+  for (const z of zones.values()) {
+    if (cx >= z.x && cx < z.x + z.w && cy >= z.y && cy < z.y + z.h) return true;
+  }
   return false;
 }
 
@@ -185,7 +209,6 @@ async function flushPixels(hubId) {
   const buf = pixelBuffer.get(hubId);
   const erased = erasedKeys.get(hubId);
 
-  // Handle erased pixels first
   if (erased && erased.size > 0) {
     for (const key of erased) {
       const [x, y] = key.split(",").map(Number);
@@ -195,16 +218,14 @@ async function flushPixels(hubId) {
           [hubId, x, y],
         );
       } catch (err) {
-        console.error("[neurohub] pixel delete error:", err.message);
+        console.error("[neurohub] pixel delete:", err.message);
       }
     }
     erased.clear();
   }
 
-  // Upsert painted pixels in batches
   if (buf && buf.size > 0) {
     const rows = [...buf.values()];
-    // Process in chunks of 200
     for (let i = 0; i < rows.length; i += 200) {
       const chunk = rows.slice(i, i + 200);
       const placeholders = chunk.map(() => "(?,?,?,?,?,?,?)").join(",");
@@ -222,26 +243,17 @@ async function flushPixels(hubId) {
       );
       try {
         await pool.execute(
-          `INSERT INTO nh_pixels (hub_id, x, y, color, user_id, username, locked)
-           VALUES ${placeholders}
-           ON DUPLICATE KEY UPDATE
-             color    = VALUES(color),
-             user_id  = VALUES(user_id),
-             username = VALUES(username),
-             locked   = VALUES(locked)`,
+          `INSERT INTO nh_pixels (hub_id,x,y,color,user_id,username,locked) VALUES ${placeholders}
+           ON DUPLICATE KEY UPDATE color=VALUES(color),user_id=VALUES(user_id),username=VALUES(username),locked=VALUES(locked)`,
           vals,
         );
       } catch (err) {
-        console.error("[neurohub] pixel upsert error:", err.message);
-        // Fallback: individual upserts
+        console.error("[neurohub] pixel upsert:", err.message);
         for (const p of chunk) {
           try {
             await pool.execute(
-              `INSERT INTO nh_pixels (hub_id, x, y, color, user_id, username, locked)
-               VALUES (?,?,?,?,?,?,?)
-               ON DUPLICATE KEY UPDATE
-                 color=VALUES(color), user_id=VALUES(user_id),
-                 username=VALUES(username), locked=VALUES(locked)`,
+              `INSERT INTO nh_pixels (hub_id,x,y,color,user_id,username,locked) VALUES (?,?,?,?,?,?,?)
+             ON DUPLICATE KEY UPDATE color=VALUES(color),user_id=VALUES(user_id),username=VALUES(username),locked=VALUES(locked)`,
               [
                 hubId,
                 p.x,
@@ -253,31 +265,26 @@ async function flushPixels(hubId) {
               ],
             );
           } catch (e2) {
-            console.error(
-              "[neurohub] pixel individual upsert error:",
-              e2.message,
-            );
+            console.error("[neurohub] pixel individual:", e2.message);
           }
         }
       }
     }
   }
 }
-
 async function flushAllPixels() {
-  for (const hubId of pixelBuffer.keys()) {
+  for (const hubId of pixelBuffer.keys())
     await flushPixels(hubId).catch((e) =>
-      console.error(`[neurohub] flushPixels(${hubId}) error:`, e.message),
+      console.error(`[neurohub] flush(${hubId}):`, e.message),
     );
-  }
 }
 
 // ── State builder ─────────────────────────────────────────────────────────────
 function buildState(hubId) {
   const pixels = [];
-  (pixelBuffer.get(hubId) || new Map()).forEach((p) => {
-    pixels.push([p.x, p.y, p.color, p.locked ? 1 : 0]);
-  });
+  (pixelBuffer.get(hubId) || new Map()).forEach((p) =>
+    pixels.push([p.x, p.y, p.color, p.locked ? 1 : 0]),
+  );
   const bubbles = [...(bubbleCache.get(hubId) || new Map()).values()];
   const branches = [];
   (branchCache.get(hubId) || new Set()).forEach((k) => {
@@ -285,9 +292,9 @@ function buildState(hubId) {
     branches.push([p, c]);
   });
   const chat = (chatCache.get(hubId) || []).slice(-50);
-  return { pixels, bubbles, branches, chat };
+  const zones = [...(zoneCache.get(hubId) || new Map()).values()];
+  return { pixels, bubbles, branches, chat, zones };
 }
-
 function getPresence(hubId) {
   return presence.get(hubId) || new Map();
 }
@@ -295,7 +302,7 @@ function presenceList(hubId) {
   return [...getPresence(hubId).values()];
 }
 
-// ── Socket server ─────────────────────────────────────────────────────────────
+// ── Server ────────────────────────────────────────────────────────────────────
 function startServer() {
   const httpServer = http.createServer((req, res) => {
     if (req.url === "/health") {
@@ -322,14 +329,12 @@ function startServer() {
     pingTimeout: 25_000,
   });
 
-  // Auth middleware
   io.use(async (socket, next) => {
     const { user_id, username, hub_id } = socket.handshake.auth || {};
     if (!user_id || !username) return next(new Error("auth_required"));
     socket.userId = String(user_id);
     socket.username = String(username).substring(0, 64);
     socket.hubId = String(hub_id || "public").substring(0, 64);
-    // Resolve admin from DB — don't trust client
     socket.isAdmin = await resolveAdmin(user_id);
     next();
   });
@@ -340,18 +345,16 @@ function startServer() {
 
     socket.join(hubId);
     ensureHubBuffers(hubId);
-
-    // Send full state to this socket
     socket.emit("state", buildState(hubId));
+    // Also send admin status to client so it can show admin UI
+    socket.emit("auth_info", { is_admin: isAdmin });
 
-    // Register presence
     getPresence(hubId).set(socket.id, {
       user_id: userId,
       username,
       x: WORLD_W / 2,
       y: WORLD_H / 2,
     });
-    // Broadcast updated presence list to everyone in hub
     io.to(hubId).emit("presence_list", presenceList(hubId));
 
     // ── PIXEL ────────────────────────────────────────────────────────────────
@@ -365,8 +368,14 @@ function startServer() {
         : String(data.color || "").match(/^#[0-9a-fA-F]{6}$/)
           ? data.color
           : "#ffffff";
-
       if (isNaN(x) || isNaN(y) || x < 0 || y < 0) return;
+
+      // Cell coordinates for zone check
+      const cx = x,
+        cy = y; // already in cell coords from client
+
+      // Block non-admins in locked zones
+      if (!isAdmin && isInLockedZone(hubId, cx, cy)) return;
 
       const buf = pixelBuffer.get(hubId);
       const erased = erasedKeys.get(hubId);
@@ -384,7 +393,6 @@ function startServer() {
         buf.set(key, { x, y, color, user_id: userId, username, locked });
       }
 
-      // Emit to ALL clients in hub (including sender so they see confirmation)
       io.to(hubId).emit("pixel", {
         x,
         y,
@@ -392,11 +400,7 @@ function startServer() {
         erase,
         locked,
       });
-
-      // Flush if buffer is large
-      if (buf.size >= FLUSH_BATCH) {
-        flushPixels(hubId).catch(console.error);
-      }
+      if (buf.size >= FLUSH_BATCH) flushPixels(hubId).catch(console.error);
     });
 
     // ── CHAT ─────────────────────────────────────────────────────────────────
@@ -412,11 +416,11 @@ function startServer() {
       io.to(hubId).emit("chat", msg);
       try {
         await pool.execute(
-          "INSERT INTO nh_chat (hub_id, user_id, username, message) VALUES (?,?,?,?)",
+          "INSERT INTO nh_chat (hub_id,user_id,username,message) VALUES (?,?,?,?)",
           [hubId, userId, username, message],
         );
       } catch (e) {
-        console.error("[neurohub] chat db error:", e.message);
+        console.error("[neurohub] chat:", e.message);
       }
     });
 
@@ -429,7 +433,6 @@ function startServer() {
         p.x = x;
         p.y = y;
       }
-      // Only broadcast to others (sender already knows their own position)
       socket.to(hubId).emit("move", { user_id: userId, username, x, y });
     });
 
@@ -449,7 +452,6 @@ function startServer() {
         type === "emotion"
           ? Math.min(10, Math.max(1, parseInt(data.emotion_val) || 5))
           : null;
-
       try {
         const [res] = await pool.execute(
           "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -467,7 +469,6 @@ function startServer() {
           ],
         );
         const bubbleId = res.insertId;
-
         if (data.parent_id) {
           const parentId = parseInt(data.parent_id);
           await pool.execute(
@@ -480,7 +481,6 @@ function startServer() {
             child_id: bubbleId,
           });
         }
-
         const bubble = {
           id: bubbleId,
           type,
@@ -497,16 +497,16 @@ function startServer() {
         io.to(hubId).emit("bubble_update", bubble);
         if (typeof ack === "function") ack({ ok: true, id: bubbleId });
       } catch (e) {
-        console.error("[neurohub] bubble_save error:", e.message);
+        console.error("[neurohub] bubble_save:", e.message);
         if (typeof ack === "function") ack({ ok: false });
       }
     });
 
     // ── BUBBLE MOVE ───────────────────────────────────────────────────────────
     socket.on("bubble_move", async (data) => {
-      const id = parseInt(data.id);
-      const x = parseInt(data.x);
-      const y = parseInt(data.y);
+      const id = parseInt(data.id),
+        x = parseInt(data.x),
+        y = parseInt(data.y);
       if (isNaN(id) || isNaN(x) || isNaN(y)) return;
       const b = bubbleCache.get(hubId)?.get(id);
       if (b) {
@@ -521,7 +521,7 @@ function startServer() {
           id,
         ]);
       } catch (e) {
-        console.error("[neurohub] bubble_move error:", e.message);
+        console.error("[neurohub] bubble_move:", e.message);
       }
     });
 
@@ -544,7 +544,7 @@ function startServer() {
             [b.emotion, b.emotion_val, id],
           );
         } catch (e) {
-          console.error("[neurohub] bubble_edit emotion:", e.message);
+          console.error(e.message);
         }
       } else {
         if (data.content !== undefined)
@@ -555,7 +555,7 @@ function startServer() {
             id,
           ]);
         } catch (e) {
-          console.error("[neurohub] bubble_edit brain:", e.message);
+          console.error(e.message);
         }
       }
       io.to(hubId).emit("bubble_update", b);
@@ -567,12 +567,11 @@ function startServer() {
       if (isNaN(id)) return;
       bubbleCache.get(hubId)?.delete(id);
       const bc = branchCache.get(hubId);
-      if (bc) {
+      if (bc)
         for (const k of [...bc]) {
           const [p, c] = k.split("-").map(Number);
           if (p === id || c === id) bc.delete(k);
         }
-      }
       io.to(hubId).emit("bubble_delete", { id });
       try {
         await pool.execute("DELETE FROM nh_bubbles WHERE id=?", [id]);
@@ -581,7 +580,58 @@ function startServer() {
           [id, id],
         );
       } catch (e) {
-        console.error("[neurohub] bubble_delete error:", e.message);
+        console.error(e.message);
+      }
+    });
+
+    // ── ADMIN ZONE ADD ────────────────────────────────────────────────────────
+    socket.on("zone_add", async (data, ack) => {
+      if (!isAdmin) {
+        if (typeof ack === "function") ack({ ok: false, reason: "not_admin" });
+        return;
+      }
+      const x = parseInt(data.x),
+        y = parseInt(data.y),
+        w = parseInt(data.w),
+        h = parseInt(data.h);
+      const label = String(data.label || "").substring(0, 64);
+      if (isNaN(x) || isNaN(y) || w < 1 || h < 1) {
+        if (typeof ack === "function") ack({ ok: false });
+        return;
+      }
+      try {
+        const [res] = await pool.execute(
+          "INSERT INTO nh_admin_zones (hub_id,x,y,w,h,label) VALUES (?,?,?,?,?,?)",
+          [hubId, x, y, w, h, label],
+        );
+        const zone = { id: res.insertId, x, y, w, h, label };
+        zoneCache.get(hubId).set(zone.id, zone);
+        io.to(hubId).emit("zone_add", zone);
+        if (typeof ack === "function") ack({ ok: true, id: zone.id });
+        console.log(
+          `[neurohub] Zone added ${JSON.stringify(zone)} by ${username}`,
+        );
+      } catch (e) {
+        console.error("[neurohub] zone_add:", e.message);
+        if (typeof ack === "function") ack({ ok: false });
+      }
+    });
+
+    // ── ADMIN ZONE DELETE ─────────────────────────────────────────────────────
+    socket.on("zone_delete", async (data, ack) => {
+      if (!isAdmin) {
+        if (typeof ack === "function") ack({ ok: false, reason: "not_admin" });
+        return;
+      }
+      const id = parseInt(data.id);
+      if (isNaN(id)) return;
+      zoneCache.get(hubId)?.delete(id);
+      io.to(hubId).emit("zone_delete", { id });
+      try {
+        await pool.execute("DELETE FROM nh_admin_zones WHERE id=?", [id]);
+        if (typeof ack === "function") ack({ ok: true });
+      } catch (e) {
+        console.error("[neurohub] zone_delete:", e.message);
       }
     });
 
@@ -599,11 +649,8 @@ function startServer() {
   });
 }
 
-const WORLD_W = 4000;
-const WORLD_H = 2800;
-
 async function shutdown() {
-  console.log("[neurohub] Shutting down — flushing pixels…");
+  console.log("[neurohub] Shutdown — flushing pixels…");
   await flushAllPixels();
   process.exit(0);
 }
@@ -611,6 +658,6 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 bootstrap().catch((err) => {
-  console.error("[neurohub] Fatal bootstrap error:", err);
+  console.error("[neurohub] Fatal:", err);
   process.exit(1);
 });
