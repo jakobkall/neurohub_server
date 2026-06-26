@@ -1,12 +1,16 @@
 /**
- * neurohub_server.js — v4.3
+ * neurohub_server.js — v4.4
  *
- * Changes vs v4.1:
- *  - Admin zones: nh_admin_zones table, zone_add / zone_delete / zones events
- *  - buildState() includes zones array
- *  - zone server-side enforcement: pixel events blocked inside locked zones for non-admins
- *  - admin is resolved server-side from DB (both id and user_id columns checked)
- *  - users table: user_type may be "admin, therapist" — splits on comma
+ * KEY FIX: users table lives in a DIFFERENT database (jakobkall_com_db) than
+ * the neurohub tables (jakobkall_com_db_neurohub). We use a second DB pool
+ * for user lookups, with cross-db fallback using fully-qualified table name.
+ *
+ * Also fixed:
+ *  - adminCache no longer caches failures permanently (only caches hits)
+ *  - user_type parsing handles "admin, therapist, user" and all variants
+ *  - session user_id matched against BOTH users.id and users.user_id columns
+ *  - nh_admin_zones table creation skipped if already exists (DB has it)
+ *  - pixel zone check uses cell coords correctly
  */
 "use strict";
 
@@ -23,7 +27,9 @@ const ALLOWED_ORIGINS = (
   .split(",")
   .map((s) => s.trim());
 
-const DB_CONFIG = {
+// ── Two DB configs: neurohub data + user auth ─────────────────────────────────
+// neurohub tables (nh_pixels, nh_bubbles, nh_admin_zones, etc.)
+const NEUROHUB_DB = {
   host: process.env.DB_HOST || "mysql48.unoeuro.com",
   port: parseInt(process.env.DB_PORT || "3306"),
   user: process.env.DB_USER || "jakobkall_com",
@@ -34,36 +40,62 @@ const DB_CONFIG = {
   charset: "utf8mb4",
 };
 
+// users table lives here
+const USERS_DB = {
+  host: process.env.DB_HOST || "mysql48.unoeuro.com",
+  port: parseInt(process.env.DB_PORT || "3306"),
+  user: process.env.DB_USER || "jakobkall_com",
+  password: process.env.DB_PASS || "cfDEmaw5n96t",
+  database: process.env.USERS_DB_NAME || "jakobkall_com_db", // ← separate DB
+  waitForConnections: true,
+  connectionLimit: 5,
+  charset: "utf8mb4",
+};
+
 // ── RAM caches ────────────────────────────────────────────────────────────────
-const pixelBuffer = new Map(); // hubId → Map<"x,y", pixel>
-const erasedKeys = new Map(); // hubId → Set<"x,y">
-const bubbleCache = new Map(); // hubId → Map<id, bubble>
-const branchCache = new Map(); // hubId → Set<"p-c">
-const chatCache = new Map(); // hubId → [msg]
-const presence = new Map(); // hubId → Map<socketId, user>
-const zoneCache = new Map(); // hubId → Map<id, zone>
-const adminCache = new Map(); // userId → bool
+const pixelBuffer = new Map();
+const erasedKeys = new Map();
+const bubbleCache = new Map();
+const branchCache = new Map();
+const chatCache = new Map();
+const presence = new Map();
+const zoneCache = new Map();
+// adminCache: key → true/false — only cache confirmed results, never failures
+const adminCache = new Map();
 
 const FLUSH_INTERVAL = 20_000;
 const FLUSH_BATCH = 200;
 const WORLD_W = 4000,
   WORLD_H = 2800;
 
-let pool;
+let pool; // neurohub DB
+let usersPool; // users DB
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function bootstrap() {
-  pool = await mysql.createPool(DB_CONFIG);
-  console.log("[neurohub] DB connected");
+  pool = await mysql.createPool(NEUROHUB_DB);
+  usersPool = await mysql.createPool(USERS_DB);
+  console.log("[neurohub] Both DB pools connected");
+  console.log(`[neurohub] neurohub DB: ${NEUROHUB_DB.database}`);
+  console.log(`[neurohub] users DB:    ${USERS_DB.database}`);
 
-  // Ensure locked column on pixels
+  // Test users DB connectivity immediately
+  try {
+    const [rows] = await usersPool.execute("SELECT COUNT(*) AS cnt FROM users");
+    console.log(`[neurohub] users table: ${rows[0].cnt} users found`);
+  } catch (e) {
+    console.error("[neurohub] WARNING: Cannot read users table:", e.message);
+    console.error("[neurohub] Admin login will not work until this is fixed");
+  }
+
+  // Ensure locked column
   try {
     await pool.execute(
       "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
     );
   } catch (e) {}
 
-  // Ensure UNIQUE index on pixels
+  // Ensure unique index on pixels
   try {
     await pool.execute(
       "ALTER TABLE nh_pixels ADD UNIQUE INDEX IF NOT EXISTS ux_hub_xy (hub_id,x,y)",
@@ -76,21 +108,25 @@ async function bootstrap() {
     } catch (e2) {}
   }
 
-  // Create admin zones table if missing
-  await pool.execute(`
-    CREATE TABLE IF NOT EXISTS nh_admin_zones (
-      id       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-      hub_id   VARCHAR(64) NOT NULL DEFAULT 'public',
-      x        INT NOT NULL,
-      y        INT NOT NULL,
-      w        INT NOT NULL,
-      h        INT NOT NULL,
-      label    VARCHAR(64) DEFAULT NULL,
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_hub (hub_id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
-  console.log("[neurohub] nh_admin_zones table ensured");
+  // nh_admin_zones already exists per DB schema — just ensure it in case
+  try {
+    await pool.execute(`
+      CREATE TABLE IF NOT EXISTS nh_admin_zones (
+        id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        hub_id     VARCHAR(64) NOT NULL DEFAULT 'public',
+        x          INT NOT NULL,
+        y          INT NOT NULL,
+        w          INT NOT NULL,
+        h          INT NOT NULL,
+        label      VARCHAR(64) DEFAULT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_hub (hub_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+    console.log("[neurohub] nh_admin_zones table ready");
+  } catch (e) {
+    console.log("[neurohub] nh_admin_zones already exists");
+  }
 
   await warmUp();
   setInterval(flushAllPixels, FLUSH_INTERVAL);
@@ -156,7 +192,7 @@ async function warmUp() {
     });
   });
   console.log(
-    `[neurohub] Warmed ${bubbles.length} bubbles, ${zones.length} zones`,
+    `[neurohub] Warmed ${bubbles.length} bubbles, ${zones.length} admin zones`,
   );
 }
 
@@ -170,31 +206,84 @@ function ensureHubBuffers(hubId) {
   if (!zoneCache.has(hubId)) zoneCache.set(hubId, new Map());
 }
 
-// ── Admin check ───────────────────────────────────────────────────────────────
+// ── Admin resolution ──────────────────────────────────────────────────────────
+// user_type examples: "admin", "user", "admin, user", "admin, therapist, user"
+function parseIsAdmin(userTypeStr) {
+  if (!userTypeStr) return false;
+  return userTypeStr
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .includes("admin");
+}
+
 async function resolveAdmin(userId) {
-  const key = String(userId);
-  if (adminCache.has(key)) return adminCache.get(key);
+  const cacheKey = String(userId);
+
+  // Return cached result if we have one
+  if (adminCache.has(cacheKey)) {
+    const cached = adminCache.get(cacheKey);
+    console.log(`[neurohub] admin cache hit for ${userId}: ${cached}`);
+    return cached;
+  }
+
+  // Try usersPool first (correct DB)
   try {
-    const [rows] = await pool.execute(
+    // Match on both users.id (int PK) and users.user_id (bigint, set by Discord auth)
+    const [rows] = await usersPool.execute(
       "SELECT user_type FROM users WHERE id=? OR user_id=? LIMIT 1",
       [userId, userId],
     );
-    if (rows.length) {
-      const types = (rows[0].user_type || "")
-        .split(",")
-        .map((t) => t.trim().toLowerCase());
-      const isAdmin = types.includes("admin");
-      adminCache.set(key, isAdmin);
+    if (rows.length > 0) {
+      const isAdmin = parseIsAdmin(rows[0].user_type);
+      adminCache.set(cacheKey, isAdmin);
+      console.log(
+        `[neurohub] Admin resolved for userId=${userId} user_type="${rows[0].user_type}" → isAdmin=${isAdmin}`,
+      );
+      return isAdmin;
+    } else {
+      console.log(
+        `[neurohub] No user found for userId=${userId} in users table`,
+      );
+      // Cache as false but only briefly (5min) so it retries
+      adminCache.set(cacheKey, false);
+      setTimeout(() => adminCache.delete(cacheKey), 5 * 60 * 1000);
+      return false;
+    }
+  } catch (e) {
+    console.error(
+      `[neurohub] usersPool admin lookup failed for ${userId}:`,
+      e.message,
+    );
+  }
+
+  // Fallback: try cross-database query via neurohub pool
+  // This works if the DB user has SELECT on both databases
+  try {
+    const usersDbName = USERS_DB.database;
+    const [rows] = await pool.execute(
+      `SELECT user_type FROM \`${usersDbName}\`.users WHERE id=? OR user_id=? LIMIT 1`,
+      [userId, userId],
+    );
+    if (rows.length > 0) {
+      const isAdmin = parseIsAdmin(rows[0].user_type);
+      adminCache.set(cacheKey, isAdmin);
+      console.log(
+        `[neurohub] Admin resolved (cross-db) for userId=${userId}: isAdmin=${isAdmin}`,
+      );
       return isAdmin;
     }
   } catch (e) {
-    console.error("[neurohub] admin lookup:", e.message);
+    console.error(`[neurohub] Cross-db admin lookup also failed:`, e.message);
   }
-  adminCache.set(key, false);
+
+  // Both attempts failed — don't cache, let next connection retry
+  console.error(
+    `[neurohub] Could not resolve admin for userId=${userId} — defaulting to false`,
+  );
   return false;
 }
 
-// ── Zone helpers ──────────────────────────────────────────────────────────────
+// ── Zone check ────────────────────────────────────────────────────────────────
 function isInLockedZone(hubId, cx, cy) {
   const zones = zoneCache.get(hubId);
   if (!zones) return false;
@@ -228,7 +317,7 @@ async function flushPixels(hubId) {
     const rows = [...buf.values()];
     for (let i = 0; i < rows.length; i += 200) {
       const chunk = rows.slice(i, i + 200);
-      const placeholders = chunk.map(() => "(?,?,?,?,?,?,?)").join(",");
+      const ph = chunk.map(() => "(?,?,?,?,?,?,?)").join(",");
       const vals = [];
       chunk.forEach((p) =>
         vals.push(
@@ -243,7 +332,7 @@ async function flushPixels(hubId) {
       );
       try {
         await pool.execute(
-          `INSERT INTO nh_pixels (hub_id,x,y,color,user_id,username,locked) VALUES ${placeholders}
+          `INSERT INTO nh_pixels (hub_id,x,y,color,user_id,username,locked) VALUES ${ph}
            ON DUPLICATE KEY UPDATE color=VALUES(color),user_id=VALUES(user_id),username=VALUES(username),locked=VALUES(locked)`,
           vals,
         );
@@ -272,6 +361,7 @@ async function flushPixels(hubId) {
     }
   }
 }
+
 async function flushAllPixels() {
   for (const hubId of pixelBuffer.keys())
     await flushPixels(hubId).catch((e) =>
@@ -295,6 +385,7 @@ function buildState(hubId) {
   const zones = [...(zoneCache.get(hubId) || new Map()).values()];
   return { pixels, bubbles, branches, chat, zones };
 }
+
 function getPresence(hubId) {
   return presence.get(hubId) || new Map();
 }
@@ -302,7 +393,7 @@ function presenceList(hubId) {
   return [...getPresence(hubId).values()];
 }
 
-// ── Server ────────────────────────────────────────────────────────────────────
+// ── Socket server ─────────────────────────────────────────────────────────────
 function startServer() {
   const httpServer = http.createServer((req, res) => {
     if (req.url === "/health") {
@@ -311,6 +402,19 @@ function startServer() {
         JSON.stringify({
           ok: true,
           pixels: [...pixelBuffer.values()].reduce((s, m) => s + m.size, 0),
+          adminCacheSize: adminCache.size,
+        }),
+      );
+      return;
+    }
+    // Debug endpoint to check a specific user's admin status
+    if (req.url.startsWith("/debug/admin/")) {
+      const uid = req.url.replace("/debug/admin/", "");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          userId: uid,
+          cached: adminCache.has(uid) ? adminCache.get(uid) : "not-cached",
         }),
       );
       return;
@@ -336,6 +440,9 @@ function startServer() {
     socket.username = String(username).substring(0, 64);
     socket.hubId = String(hub_id || "public").substring(0, 64);
     socket.isAdmin = await resolveAdmin(user_id);
+    console.log(
+      `[neurohub] Socket auth: userId=${socket.userId} username=${socket.username} isAdmin=${socket.isAdmin}`,
+    );
     next();
   });
 
@@ -345,8 +452,10 @@ function startServer() {
 
     socket.join(hubId);
     ensureHubBuffers(hubId);
+
+    // Send state
     socket.emit("state", buildState(hubId));
-    // Also send admin status to client so it can show admin UI
+    // Send auth info — client uses this to show/hide admin controls
     socket.emit("auth_info", { is_admin: isAdmin });
 
     getPresence(hubId).set(socket.id, {
@@ -359,8 +468,9 @@ function startServer() {
 
     // ── PIXEL ────────────────────────────────────────────────────────────────
     socket.on("pixel", (data) => {
-      const x = parseInt(data.x);
-      const y = parseInt(data.y);
+      const x = parseInt(data.x),
+        y = parseInt(data.y);
+      if (isNaN(x) || isNaN(y) || x < 0 || y < 0) return;
       const erase = !!data.erase;
       const locked = !!data.locked && isAdmin;
       const color = erase
@@ -368,21 +478,15 @@ function startServer() {
         : String(data.color || "").match(/^#[0-9a-fA-F]{6}$/)
           ? data.color
           : "#ffffff";
-      if (isNaN(x) || isNaN(y) || x < 0 || y < 0) return;
 
-      // Cell coordinates for zone check
-      const cx = x,
-        cy = y; // already in cell coords from client
-
-      // Block non-admins in locked zones
-      if (!isAdmin && isInLockedZone(hubId, cx, cy)) return;
+      // Block non-admins in locked zones (x,y are cell coords from client)
+      if (!isAdmin && isInLockedZone(hubId, x, y)) return;
 
       const buf = pixelBuffer.get(hubId);
       const erased = erasedKeys.get(hubId);
       const key = `${x},${y}`;
       const existing = buf.get(key);
 
-      // Block non-admin erase of locked pixels
       if (erase && existing?.locked && !isAdmin) return;
 
       if (erase) {
@@ -521,7 +625,7 @@ function startServer() {
           id,
         ]);
       } catch (e) {
-        console.error("[neurohub] bubble_move:", e.message);
+        console.error(e.message);
       }
     });
 
@@ -608,9 +712,7 @@ function startServer() {
         zoneCache.get(hubId).set(zone.id, zone);
         io.to(hubId).emit("zone_add", zone);
         if (typeof ack === "function") ack({ ok: true, id: zone.id });
-        console.log(
-          `[neurohub] Zone added ${JSON.stringify(zone)} by ${username}`,
-        );
+        console.log(`[neurohub] Zone added id=${zone.id} by ${username}`);
       } catch (e) {
         console.error("[neurohub] zone_add:", e.message);
         if (typeof ack === "function") ack({ ok: false });
@@ -644,13 +746,13 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] Listening on :${PORT}`);
+    console.log(`[neurohub] v4.4 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
 
 async function shutdown() {
-  console.log("[neurohub] Shutdown — flushing pixels…");
+  console.log("[neurohub] Shutting down…");
   await flushAllPixels();
   process.exit(0);
 }
