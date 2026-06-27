@@ -1,7 +1,7 @@
 /**
- * neurohub_server.js — v6.0
+ * neurohub_server.js — v6.1
  *
- * NYT: Dynamisk lazy-loading af private hubs og kopiering af nh_hub_defaults.
+ * Integreret med dynamisk lazy-loading af private hubs og auto-generering af access_code.
  */
 "use strict";
 
@@ -42,16 +42,16 @@ const USERS_DB = {
 };
 
 // ── RAM caches ────────────────────────────────────────────────────────────────
-const pixelBuffer = new Map(); // hubId → Map<"x,y", {x,y,color,user_id,username,locked}>
-const erasedKeys = new Map(); // hubId → Set<"x,y">
+const pixelBuffer = new Map();
+const erasedKeys = new Map();
 const bubbleCache = new Map();
 const branchCache = new Map();
 const chatCache = new Map();
 const presence = new Map();
-const zoneCache = new Map(); // hubId → Map<id, {id,x,y,w,h,label}>
-const adminCache = new Map(); // userId → bool (only caches confirmed results)
+const zoneCache = new Map();
+const adminCache = new Map();
 
-// State management for dynamically loaded hubs
+// State tracking for dynamic hubs
 const loadedHubs = new Set();
 const initPromises = new Map();
 
@@ -60,8 +60,8 @@ const FLUSH_BATCH = 200;
 const WORLD_W = 4000,
   WORLD_H = 2800;
 
-let pool; // neurohub DB
-let usersPool; // users DB
+let pool;
+let usersPool;
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function bootstrap() {
@@ -76,7 +76,7 @@ async function bootstrap() {
     console.error("[neurohub] WARNING: Cannot read users table:", e.message);
   }
 
-  // Schema checks
+  // Schema-udvidelser hvis de mangler
   try {
     await pool.execute(
       "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
@@ -168,13 +168,9 @@ async function warmUp() {
     });
   });
 
-  // Also ensure 'public' is explicitly marked as loaded
   loadedHubs.add("public");
   ensureHubBuffers("public");
-
-  console.log(
-    `[neurohub] Warmed ${pixels.length} pixels, ${bubbles.length} bubbles, ${zones.length} admin zones`,
-  );
+  console.log(`[neurohub] Warmed state from database.`);
 }
 
 function ensureHubBuffers(hubId) {
@@ -187,7 +183,7 @@ function ensureHubBuffers(hubId) {
   if (!zoneCache.has(hubId)) zoneCache.set(hubId, new Map());
 }
 
-// ── Auto Hub Builder (Private & Default loading) ──────────────────────────────
+// ── Lazy Hub Builder (Fallback og Memory Caching) ─────────────────────────────
 async function initHubIfNeeded(hubId) {
   if (loadedHubs.has(hubId)) return;
   if (!initPromises.has(hubId)) {
@@ -209,17 +205,22 @@ async function _doInitHub(hubId) {
       [hubId],
     );
 
-    // 1. Opret ny hub og kopier defaults, hvis den ikke findes
+    // Hvis PHP endnu ikke har oprettet rækken (fx udefrakommende socket), gør vi det her
     if (hubRows.length === 0) {
-      console.log(`[neurohub] Creating new Hub: ${hubId}`);
+      console.log(
+        `[neurohub] Creating hub from fallback server thread: ${hubId}`,
+      );
       const isPrivate = hubId.startsWith("private") ? 1 : 0;
       const label = hubId.startsWith("private_")
         ? `Privat Hub (${hubId.split("_")[1]})`
         : hubId;
+      const accessCode = isPrivate
+        ? Math.floor(100000 + Math.random() * 900000).toString()
+        : null;
 
       await pool.execute(
-        "INSERT INTO nh_hubs (id, label, is_private) VALUES (?, ?, ?)",
-        [hubId, label, isPrivate],
+        "INSERT INTO nh_hubs (id, label, is_private, access_code) VALUES (?, ?, ?, ?)",
+        [hubId, label, isPrivate, accessCode],
       );
 
       // Kopier default PIXELS
@@ -241,11 +242,9 @@ async function _doInitHub(hubId) {
       `,
         [hubId],
       );
-
-      console.log(`[neurohub] Copied defaults for ${hubId}`);
     }
 
-    // 2. Load hubbens data ind i memory (hvis den er ny, eller lå i dvale)
+    // Load alt data ind i RAM-cache for denne hub
     const [pixels] = await pool.query(
       "SELECT * FROM nh_pixels WHERE hub_id = ?",
       [hubId],
@@ -305,13 +304,13 @@ async function _doInitHub(hubId) {
     );
 
     loadedHubs.add(hubId);
-    console.log(`[neurohub] Successfully loaded state for ${hubId}`);
+    console.log(`[neurohub] Loaded memory tables for ${hubId}`);
   } catch (err) {
     console.error(`[neurohub] Error initializing hub ${hubId}:`, err.message);
   }
 }
 
-// ── Admin resolution ──────────────────────────────────────────────────────────
+// ── Admin og zone hjælpefunktioner ──────────────────────────────────────────
 function parseIsAdmin(userTypeStr) {
   if (!userTypeStr) return false;
   return userTypeStr
@@ -334,29 +333,12 @@ async function resolveAdmin(userId) {
       adminCache.set(cacheKey, isAdmin);
       return isAdmin;
     }
-  } catch (e) {
-    // Cross-DB check below
-  }
-
-  try {
-    const usersDbName = USERS_DB.database;
-    const [rows] = await pool.execute(
-      `SELECT user_type FROM \`${usersDbName}\`.users WHERE id=? OR user_id=? LIMIT 1`,
-      [userId, userId],
-    );
-    if (rows.length > 0) {
-      const isAdmin = parseIsAdmin(rows[0].user_type);
-      adminCache.set(cacheKey, isAdmin);
-      return isAdmin;
-    }
   } catch (e) {}
 
   adminCache.set(cacheKey, false);
-  setTimeout(() => adminCache.delete(cacheKey), 5 * 60 * 1000);
   return false;
 }
 
-// ── Zone helpers ──────────────────────────────────────────────────────────────
 function isInLockedZone(hubId, cx, cy) {
   const zones = zoneCache.get(hubId);
   if (!zones) return false;
@@ -375,7 +357,7 @@ function getZoneAt(hubId, cx, cy) {
   return null;
 }
 
-// ── Pixel flush ───────────────────────────────────────────────────────────────
+// ── DB flushing ───────────────────────────────────────────────────────────────
 async function flushPixels(hubId) {
   const buf = pixelBuffer.get(hubId);
   const erased = erasedKeys.get(hubId);
@@ -416,9 +398,7 @@ async function flushPixels(hubId) {
           `INSERT INTO nh_pixels (hub_id,x,y,color,user_id,username,locked,locked_by_zone) VALUES ${ph} ON DUPLICATE KEY UPDATE color=VALUES(color),user_id=VALUES(user_id),username=VALUES(username),locked=VALUES(locked),locked_by_zone=VALUES(locked_by_zone)`,
           vals,
         );
-      } catch (err) {
-        console.error("[neurohub] pixel batch error:", err.message);
-      }
+      } catch (err) {}
     }
   }
 }
@@ -426,12 +406,11 @@ async function flushPixels(hubId) {
 async function flushAllPixels() {
   for (const hubId of pixelBuffer.keys()) {
     await flushPixels(hubId).catch((e) =>
-      console.error(`[neurohub] flush(${hubId}):`, e.message),
+      console.error(`[neurohub] flush error:`, e.message),
     );
   }
 }
 
-// ── State builder ─────────────────────────────────────────────────────────────
 function buildState(hubId) {
   const pixels = [];
   (pixelBuffer.get(hubId) || new Map()).forEach((p) =>
@@ -455,25 +434,16 @@ function presenceList(hubId) {
   return [...getPresence(hubId).values()];
 }
 
-// ── Socket server ─────────────────────────────────────────────────────────────
+// ── Socket server setup ───────────────────────────────────────────────────────
 function startServer() {
   const httpServer = http.createServer(async (req, res) => {
-    // CORS Header required for fetch requests from UI Hub Switcher
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-
     if (req.method === "OPTIONS") {
       res.writeHead(200);
       return res.end();
     }
 
-    if (req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, hubsLoaded: loadedHubs.size }));
-      return;
-    }
-
-    // HTTP API - Henter listen af Hubs til UI menuen
     if (req.url === "/hubs") {
       try {
         const [hubs] = await pool.query(
@@ -509,18 +479,12 @@ function startServer() {
     socket.hubId = String(hub_id || "public").substring(0, 64);
     socket.isAdmin = await resolveAdmin(user_id);
 
-    // Tjek om vi skal generere/loade hubben inden de lukkes ind!
     await initHubIfNeeded(socket.hubId);
-
-    console.log(
-      `[neurohub] Socket auth: userId=${socket.userId} admin=${socket.isAdmin} hub=${socket.hubId}`,
-    );
     next();
   });
 
   io.on("connection", (socket) => {
     const { userId, username, hubId, isAdmin } = socket;
-
     socket.join(hubId);
 
     socket.emit("state", buildState(hubId));
@@ -595,9 +559,7 @@ function startServer() {
         .substring(0, 500);
       if (!message) return;
       const msg = { username, message, ts: Math.floor(Date.now() / 1000) };
-      const cc = chatCache.get(hubId);
-      cc.push(msg);
-      if (cc.length > 50) cc.shift();
+      chatCache.get(hubId).push(msg);
       io.to(hubId).emit("chat", msg);
       try {
         await pool.execute(
@@ -852,13 +814,11 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.0 listening on :${PORT}`);
-    console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
+    console.log(`[neurohub] Listening on :${PORT}`);
   });
 }
 
 async function shutdown() {
-  console.log("[neurohub] Shutting down…");
   await flushAllPixels();
   process.exit(0);
 }
@@ -866,6 +826,6 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 bootstrap().catch((err) => {
-  console.error("[neurohub] Fatal:", err);
+  console.error("[neurohub] Fatal initialization crash:", err);
   process.exit(1);
 });
