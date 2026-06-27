@@ -484,21 +484,6 @@ function startServer() {
   });
 
   io.on("connection", (socket) => {
-    // Tilføj dette i din neurohub_server.js inde i din "connection" blok
-    socket.on("admin_force_reload", async () => {
-      if (!isAdmin(socket)) return; // Sørg for at kun admins kan dette!
-      console.log("[!] Admin tvang genindlæsning af pixels...");
-
-      // 1. Tøm den eksisterende cache i hukommelsen
-      pixelCache.clear(); // (Eller hvad din variabel hedder)
-
-      // 2. Genindlæs fra DB
-      await loadPixelsFromDb(hubId);
-
-      // 3. Fortæl alle klienter at de skal opdatere deres billede
-      io.to(hubId).emit("full_canvas_reload");
-    });
-
     const { userId, username, hubId, isAdmin } = socket;
     socket.join(hubId);
 
