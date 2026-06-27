@@ -1,13 +1,8 @@
 /**
- * neurohub_server.js — v5.0
+ * neurohub_server.js — v5.1
  *
  * FIXES:
- *  - zone_add now auto-locks ALL pixels inside the zone and re-broadcasts them as locked
- *  - zone_delete unlocks pixels that were ONLY locked by the zone (not manually painted locked)
- *  - non-admin pixel/erase attempt in locked zone → server emits zone_flash back to that socket
- *  - adminPixelSet is properly maintained: add on lock, remove on unlock/erase
- *  - pixel broadcast includes locked flag so clients update adminPixelSet correctly
- *  - zone_flash emitted with full zone data so client can highlight the correct rect
+ * - pixel event properly blocks non-admins from painting over explicitly locked pixels (previously only blocked erasing).
  */
 "use strict";
 
@@ -460,12 +455,11 @@ function startServer() {
       const erased = erasedKeys.get(hubId);
       const existing = buf.get(key);
 
-      // Check if pixel or zone is locked
       const inLockedZone = isInLockedZone(hubId, x, y);
       const isLockedPixel = existing && existing.locked;
 
-      if (!isAdmin && (inLockedZone || (erase && isLockedPixel))) {
-        // Find the zone and emit flash back to this socket only
+      // BLOKERING: Hvis du IKKE er admin, må du HVERKEN tegne eller slette i en zone, ELLER ovenpå en allerede låst pixel.
+      if (!isAdmin && (inLockedZone || isLockedPixel)) {
         const zone = getZoneAt(hubId, x, y);
         socket.emit("zone_flash", {
           zone: zone || null,
@@ -479,9 +473,6 @@ function startServer() {
         : String(data.color || "").match(/^#[0-9a-fA-F]{6}$/)
           ? data.color
           : "#ffffff";
-
-      // Admins can't erase locked pixels set by zone unless explicitly in admin mode
-      if (erase && isLockedPixel && existing.locked_by_zone && !isAdmin) return;
 
       // locked flag: admin setting locked=true, OR pixel is inside a zone
       const locked = isAdmin && !erase && (!!data.locked || inLockedZone);
@@ -822,7 +813,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v5.0 listening on :${PORT}`);
+    console.log(`[neurohub] v5.1 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
