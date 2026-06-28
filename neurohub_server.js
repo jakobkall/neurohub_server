@@ -1,12 +1,15 @@
 /**
- * neurohub_server.js — v6.2
+ * neurohub_server.js — v6.3
  *
- * FIX: Added /reset-hub/:hubId HTTP endpoint that clears the in-RAM cache
- * for a given hub without restarting the server. This means reset_hub.php
- * can delete from DB and then call /reset-hub/public to wipe RAM too,
- * preventing the flusher from re-writing deleted data back to the DB.
- *
- * Also added: /health, /hubs endpoints.
+ * CHANGE vs v6.2:
+ *  - Hubs are NO LONGER auto-created if they don't exist in DB.
+ *    Only the "public" hub is guaranteed. All other hubs (e.g. BOOK-XXXXXXXX)
+ *    must be pre-created externally (via createBooking.inc.php).
+ *  - Socket middleware now emits "hub_not_found" error if hub doesn't exist,
+ *    so the frontend can show a proper error instead of silently failing.
+ *  - _doInitHub no longer auto-inserts into nh_hubs or copies defaults.
+ *  - /reset-hub/:hubId still works as before.
+ *  - /health, /hubs endpoints unchanged.
  */
 "use strict";
 
@@ -66,7 +69,7 @@ const WORLD_W = 4000,
 
 let pool;
 let usersPool;
-let io; // set in startServer, used by reset endpoint to broadcast
+let io;
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function bootstrap() {
@@ -171,6 +174,7 @@ async function warmUp() {
     });
   });
 
+  // Always ensure public hub exists in RAM (it's always in DB)
   loadedHubs.add("public");
   ensureHubBuffers("public");
   console.log("[neurohub] Warm-up complete");
@@ -186,33 +190,18 @@ function ensureHubBuffers(hubId) {
   if (!zoneCache.has(hubId)) zoneCache.set(hubId, new Map());
 }
 
-// ── RAM reset for a hub (called by HTTP endpoint after DB wipe) ───────────────
-// This is the KEY function that fixes the reset_hub.php problem.
-// After PHP deletes from DB, call GET /reset-hub/<hubId> to clear RAM too.
-// Then reload fresh state from DB and broadcast to all connected clients.
+// ── RAM reset for a hub ───────────────────────────────────────────────────────
 async function resetHubRAM(hubId) {
   console.log(`[neurohub] resetHubRAM: clearing RAM for hub "${hubId}"`);
-
-  // 1. Stop any pending flushes for this hub by clearing erase queue first
-  //    (we don't want the flusher to delete newly loaded DB rows)
   erasedKeys.get(hubId)?.clear();
-
-  // 2. Wipe all RAM caches for this hub
   pixelBuffer.set(hubId, new Map());
   erasedKeys.set(hubId, new Set());
   bubbleCache.set(hubId, new Map());
   branchCache.set(hubId, new Set());
   chatCache.set(hubId, []);
   zoneCache.set(hubId, new Map());
-  // Don't clear presence — connected users stay connected
-
-  // 3. Mark hub as not-loaded so initHubIfNeeded will re-fetch from DB
   loadedHubs.delete(hubId);
-
-  // 4. Reload fresh state from DB
   await initHubIfNeeded(hubId);
-
-  // 5. Broadcast fresh state to all clients currently in this hub
   if (io) {
     const state = buildState(hubId);
     io.to(hubId).emit("state", state);
@@ -220,58 +209,38 @@ async function resetHubRAM(hubId) {
       `[neurohub] resetHubRAM: broadcast fresh state to hub "${hubId}" (${state.pixels.length} pixels, ${state.zones.length} zones)`,
     );
   }
-
   return buildState(hubId);
 }
 
-// ── Lazy Hub Builder ──────────────────────────────────────────────────────────
+// ── Lazy Hub Loader ───────────────────────────────────────────────────────────
+// Returns true if hub was loaded successfully, false if hub doesn't exist in DB.
 async function initHubIfNeeded(hubId) {
-  if (loadedHubs.has(hubId)) return;
+  if (loadedHubs.has(hubId)) return true;
   if (!initPromises.has(hubId)) {
     initPromises.set(
       hubId,
       _doInitHub(hubId).finally(() => initPromises.delete(hubId)),
     );
   }
-  await initPromises.get(hubId);
+  return await initPromises.get(hubId);
 }
 
 async function _doInitHub(hubId) {
-  if (loadedHubs.has(hubId)) return;
+  if (loadedHubs.has(hubId)) return true;
   ensureHubBuffers(hubId);
 
   try {
+    // ── KEY CHANGE: Do NOT auto-create. Only load if hub exists in DB. ────────
     const [hubRows] = await pool.execute(
       "SELECT id FROM nh_hubs WHERE id = ?",
       [hubId],
     );
 
     if (hubRows.length === 0) {
-      console.log(`[neurohub] Creating hub: ${hubId}`);
-      const isPrivate = hubId.startsWith("private") ? 1 : 0;
-      const label = hubId.startsWith("private_")
-        ? `Privat Hub (${hubId.split("_")[1]})`
-        : hubId;
-      const accessCode = isPrivate
-        ? Math.floor(100000 + Math.random() * 900000).toString()
-        : null;
-      await pool.execute(
-        "INSERT INTO nh_hubs (id, label, is_private, access_code) VALUES (?, ?, ?, ?)",
-        [hubId, label, isPrivate, accessCode],
-      );
-      // Copy default pixels and zones
-      await pool.execute(
-        `INSERT IGNORE INTO nh_pixels (hub_id, x, y, color, user_id, username, locked, locked_by_zone)
-         SELECT ?, x, y, color, 999999, 'System', locked, 0
-         FROM nh_hub_defaults WHERE type = 'pixel'`,
-        [hubId],
-      );
-      await pool.execute(
-        `INSERT INTO nh_admin_zones (hub_id, x, y, w, h, label)
-         SELECT ?, x, y, w, h, label
-         FROM nh_hub_defaults WHERE type = 'zone'`,
-        [hubId],
-      );
+      // Hub does not exist — was not created via createBooking.inc.php.
+      // Return false so the socket middleware can reject the connection.
+      console.log(`[neurohub] Hub "${hubId}" not found in DB — rejecting.`);
+      return false;
     }
 
     // Load pixels
@@ -341,8 +310,10 @@ async function _doInitHub(hubId) {
     console.log(
       `[neurohub] Loaded hub "${hubId}": ${pixels.length}px, ${zones.length} zones, ${bubbles.length} bubbles`,
     );
+    return true;
   } catch (err) {
     console.error(`[neurohub] Error initializing hub ${hubId}:`, err.message);
+    return false;
   }
 }
 
@@ -514,14 +485,6 @@ function startServer() {
     }
 
     // ── GET /reset-hub/:hubId ────────────────────────────────────────────────
-    // Call this AFTER reset_hub.php has wiped the DB tables.
-    // It clears RAM and reloads fresh data from DB, then broadcasts to clients.
-    //
-    // Usage from reset_hub.php (add at the end):
-    //   file_get_contents('http://localhost:3001/reset-hub/public');
-    //   -- OR if calling from a remote context, use the actual server IP.
-    //
-    // Security: optionally add a secret token check here if needed.
     const resetMatch = req.url.match(/^\/reset-hub\/([^/?]+)/);
     if (resetMatch) {
       const hubId = decodeURIComponent(resetMatch[1]);
@@ -536,7 +499,7 @@ function startServer() {
             pixels: state.pixels.length,
             bubbles: state.bubbles.length,
             zones: state.zones.length,
-            message: `RAM reset for hub "${hubId}". ${state.pixels.length} pixels loaded from DB. State broadcast to connected clients.`,
+            message: `RAM reset for hub "${hubId}". ${state.pixels.length} pixels loaded from DB.`,
           }),
         );
       } catch (e) {
@@ -560,14 +523,22 @@ function startServer() {
     pingTimeout: 25_000,
   });
 
+  // ── Socket middleware ──────────────────────────────────────────────────────
   io.use(async (socket, next) => {
     const { user_id, username, hub_id } = socket.handshake.auth || {};
     if (!user_id || !username) return next(new Error("auth_required"));
+
     socket.userId = String(user_id);
     socket.username = String(username).substring(0, 64);
     socket.hubId = String(hub_id || "public").substring(0, 64);
     socket.isAdmin = await resolveAdmin(user_id);
-    await initHubIfNeeded(socket.hubId);
+
+    // Try to load the hub — reject if it doesn't exist in DB
+    const hubExists = await initHubIfNeeded(socket.hubId);
+    if (!hubExists) {
+      return next(new Error("hub_not_found"));
+    }
+
     next();
   });
 
@@ -835,7 +806,6 @@ function startServer() {
         );
         const zone = { id: res.insertId, x, y, w, h, label };
         zoneCache.get(hubId).set(zone.id, zone);
-
         const buf = pixelBuffer.get(hubId);
         const lockedPixels = [];
         for (let px = x; px < x + w; px++) {
@@ -877,7 +847,6 @@ function startServer() {
         if (typeof ack === "function") ack({ ok: false });
         return;
       }
-
       const buf = pixelBuffer.get(hubId);
       const unlockedPixels = [];
       for (let px = zone.x; px < zone.x + zone.w; px++) {
@@ -920,9 +889,12 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.2 listening on :${PORT}`);
+    console.log(`[neurohub] v6.3 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
     console.log(`[neurohub] Reset endpoint: GET /reset-hub/:hubId`);
+    console.log(
+      `[neurohub] Hubs are no longer auto-created — must exist in DB.`,
+    );
   });
 }
 
