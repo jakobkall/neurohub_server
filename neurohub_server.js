@@ -1,12 +1,9 @@
 /**
- * neurohub_server.js — v6.5
+ * neurohub_server.js — v6.4
  *
- * CHANGE vs v6.4:
- *  - Socket middleware now validates access_code for private hubs.
- *    If hub is private and no/wrong code is supplied → "access_denied".
- *    Frontend shows the password modal on every page load (no caching).
- *  - nonExistentHubs Set prevents repeat DB lookups for unknown hub IDs.
- *  - Hub is NEVER auto-created. Must exist in DB (via createBooking.inc.php).
+ * CHANGES:
+ * - Automatically copies defaults from `nh_hub_defaults` if a hub is loaded
+ * for the first time and is completely empty.
  */
 "use strict";
 
@@ -56,11 +53,7 @@ const presence = new Map();
 const zoneCache = new Map();
 const adminCache = new Map();
 
-// hubMeta: hubId → { is_private, access_code } — cached from DB
-const hubMeta = new Map();
-
 const loadedHubs = new Set();
-const nonExistentHubs = new Set();
 const initPromises = new Map();
 
 const FLUSH_INTERVAL = 20_000;
@@ -85,6 +78,7 @@ async function bootstrap() {
     console.error("[neurohub] WARNING: Cannot read users table:", e.message);
   }
 
+  // Schema extensions
   for (const sql of [
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked_by_zone TINYINT(1) NOT NULL DEFAULT 0",
@@ -112,14 +106,6 @@ async function bootstrap() {
 
 // ── Warm-up ───────────────────────────────────────────────────────────────────
 async function warmUp() {
-  // Pre-load hub metadata (is_private + access_code) for all known hubs
-  const [hubs] = await pool.query(
-    "SELECT id, is_private, access_code FROM nh_hubs",
-  );
-  hubs.forEach((h) => {
-    hubMeta.set(h.id, { is_private: h.is_private, access_code: h.access_code });
-  });
-
   const [pixels] = await pool.query(
     "SELECT hub_id,x,y,color,user_id,username,IFNULL(locked,0) AS locked,IFNULL(locked_by_zone,0) AS locked_by_zone FROM nh_pixels LIMIT 500000",
   );
@@ -197,60 +183,31 @@ function ensureHubBuffers(hubId) {
   if (!zoneCache.has(hubId)) zoneCache.set(hubId, new Map());
 }
 
-// ── Hub existence + access code check ────────────────────────────────────────
-// Returns: "ok" | "not_found" | "access_denied"
-async function checkHubAccess(hubId, suppliedCode, isAdmin) {
-  // public hub never needs a code
-  if (hubId === "public") return "ok";
-
-  // Fast path: already know it doesn't exist
-  if (nonExistentHubs.has(hubId)) return "not_found";
-
-  // Load meta from DB if not cached
-  if (!hubMeta.has(hubId)) {
-    try {
-      const [rows] = await pool.execute(
-        "SELECT id, is_private, access_code FROM nh_hubs WHERE id = ? LIMIT 1",
-        [hubId],
-      );
-      if (rows.length === 0) {
-        nonExistentHubs.add(hubId);
-        return "not_found";
-      }
-      hubMeta.set(hubId, {
-        is_private: rows[0].is_private,
-        access_code: rows[0].access_code,
-      });
-    } catch (e) {
-      console.error("[neurohub] checkHubAccess DB error:", e.message);
-      return "not_found";
-    }
+// ── RAM reset for a hub ───────────────────────────────────────────────────────
+async function resetHubRAM(hubId) {
+  console.log(`[neurohub] resetHubRAM: clearing RAM for hub "${hubId}"`);
+  erasedKeys.get(hubId)?.clear();
+  pixelBuffer.set(hubId, new Map());
+  erasedKeys.set(hubId, new Set());
+  bubbleCache.set(hubId, new Map());
+  branchCache.set(hubId, new Set());
+  chatCache.set(hubId, []);
+  zoneCache.set(hubId, new Map());
+  loadedHubs.delete(hubId);
+  await initHubIfNeeded(hubId);
+  if (io) {
+    const state = buildState(hubId);
+    io.to(hubId).emit("state", state);
+    console.log(
+      `[neurohub] resetHubRAM: broadcast fresh state to hub "${hubId}" (${state.pixels.length} pixels, ${state.zones.length} zones)`,
+    );
   }
-
-  const meta = hubMeta.get(hubId);
-
-  // Hub is public (is_private = 0) — always ok
-  if (!meta.is_private) return "ok";
-
-  // Hub is private — admins bypass code check
-  if (isAdmin) return "ok";
-
-  // Validate supplied code (case-insensitive)
-  if (!suppliedCode) return "access_denied";
-  if (
-    suppliedCode.trim().toLowerCase() !==
-    String(meta.access_code).trim().toLowerCase()
-  ) {
-    return "access_denied";
-  }
-
-  return "ok";
+  return buildState(hubId);
 }
 
 // ── Lazy Hub Loader ───────────────────────────────────────────────────────────
 async function initHubIfNeeded(hubId) {
   if (loadedHubs.has(hubId)) return true;
-  if (nonExistentHubs.has(hubId)) return false;
   if (!initPromises.has(hubId)) {
     initPromises.set(
       hubId,
@@ -265,24 +222,17 @@ async function _doInitHub(hubId) {
   ensureHubBuffers(hubId);
 
   try {
-    // Hub must already be in DB (created by createBooking.inc.php)
-    if (!hubMeta.has(hubId)) {
-      const [hubRows] = await pool.execute(
-        "SELECT id, is_private, access_code FROM nh_hubs WHERE id = ?",
-        [hubId],
-      );
-      if (hubRows.length === 0) {
-        console.log(`[neurohub] Hub "${hubId}" not found in DB — rejecting.`);
-        nonExistentHubs.add(hubId);
-        return false;
-      }
-      hubMeta.set(hubId, {
-        is_private: hubRows[0].is_private,
-        access_code: hubRows[0].access_code,
-      });
+    const [hubRows] = await pool.execute(
+      "SELECT id FROM nh_hubs WHERE id = ?",
+      [hubId],
+    );
+
+    if (hubRows.length === 0) {
+      console.log(`[neurohub] Hub "${hubId}" not found in DB — rejecting.`);
+      return false;
     }
 
-    // Copy defaults if hub is completely empty
+    // ── KOPERING AF DEFAULT ELEMENTER HVIS HUBBEN ER HELT TOM ──
     const [pCheck] = await pool.query(
       "SELECT 1 FROM nh_pixels WHERE hub_id = ? LIMIT 1",
       [hubId],
@@ -291,19 +241,30 @@ async function _doInitHub(hubId) {
       "SELECT 1 FROM nh_admin_zones WHERE hub_id = ? LIMIT 1",
       [hubId],
     );
+
     if (pCheck.length === 0 && zCheck.length === 0) {
-      console.log(`[neurohub] Hub "${hubId}" is empty — loading defaults.`);
+      console.log(
+        `[neurohub] Hub "${hubId}" is empty. Loading defaults from nh_hub_defaults...`,
+      );
       try {
         await pool.execute(
-          `INSERT IGNORE INTO nh_pixels (hub_id,x,y,color,locked,locked_by_zone,user_id,username)
-           SELECT ?,x,y,color,locked,0,'999999','System' FROM nh_hub_defaults WHERE type='pixel'`,
+          `
+          INSERT IGNORE INTO nh_pixels (hub_id, x, y, color, locked, locked_by_zone, user_id, username)
+          SELECT ?, x, y, color, locked, 0, '999999', 'System'
+          FROM nh_hub_defaults WHERE type = 'pixel'
+        `,
           [hubId],
         );
+
         await pool.execute(
-          `INSERT IGNORE INTO nh_admin_zones (hub_id,x,y,w,h,label)
-           SELECT ?,x,y,w,h,label FROM nh_hub_defaults WHERE type='zone'`,
+          `
+          INSERT IGNORE INTO nh_admin_zones (hub_id, x, y, w, h, label)
+          SELECT ?, x, y, w, h, label
+          FROM nh_hub_defaults WHERE type = 'zone'
+        `,
           [hubId],
         );
+        console.log(`[neurohub] Defaults loaded successfully for "${hubId}".`);
       } catch (err) {
         console.error(
           `[neurohub] Failed to load defaults for "${hubId}":`,
@@ -312,6 +273,7 @@ async function _doInitHub(hubId) {
       }
     }
 
+    // Load pixels
     const [pixels] = await pool.query(
       "SELECT * FROM nh_pixels WHERE hub_id = ?",
       [hubId],
@@ -328,6 +290,7 @@ async function _doInitHub(hubId) {
       });
     });
 
+    // Load zones
     const [zones] = await pool.query(
       "SELECT * FROM nh_admin_zones WHERE hub_id = ?",
       [hubId],
@@ -343,12 +306,14 @@ async function _doInitHub(hubId) {
       });
     });
 
+    // Load bubbles
     const [bubbles] = await pool.query(
       "SELECT * FROM nh_bubbles WHERE hub_id = ?",
       [hubId],
     );
     bubbles.forEach((b) => bubbleCache.get(hubId).set(b.id, { ...b }));
 
+    // Load branches
     const [branches] = await pool.query(
       "SELECT * FROM nh_branches WHERE hub_id = ?",
       [hubId],
@@ -357,6 +322,7 @@ async function _doInitHub(hubId) {
       branchCache.get(hubId).add(`${br.parent_id}-${br.child_id}`),
     );
 
+    // Load chat
     const [chats] = await pool.query(
       "SELECT * FROM nh_chat WHERE hub_id = ? ORDER BY id DESC LIMIT 50",
       [hubId],
@@ -371,7 +337,6 @@ async function _doInitHub(hubId) {
     );
 
     loadedHubs.add(hubId);
-    nonExistentHubs.delete(hubId);
     console.log(
       `[neurohub] Loaded hub "${hubId}": ${pixels.length}px, ${zones.length} zones, ${bubbles.length} bubbles`,
     );
@@ -380,32 +345,6 @@ async function _doInitHub(hubId) {
     console.error(`[neurohub] Error initializing hub ${hubId}:`, err.message);
     return false;
   }
-}
-
-// ── RAM reset for a hub ───────────────────────────────────────────────────────
-async function resetHubRAM(hubId) {
-  console.log(`[neurohub] resetHubRAM: clearing RAM for hub "${hubId}"`);
-  erasedKeys.get(hubId)?.clear();
-  pixelBuffer.set(hubId, new Map());
-  erasedKeys.set(hubId, new Set());
-  bubbleCache.set(hubId, new Map());
-  branchCache.set(hubId, new Set());
-  chatCache.set(hubId, []);
-  zoneCache.set(hubId, new Map());
-  loadedHubs.delete(hubId);
-  nonExistentHubs.delete(hubId);
-  hubMeta.delete(hubId); // re-fetch meta from DB on next connect
-
-  await initHubIfNeeded(hubId);
-
-  if (io) {
-    const state = buildState(hubId);
-    io.to(hubId).emit("state", state);
-    console.log(
-      `[neurohub] resetHubRAM: broadcast fresh state to hub "${hubId}" (${state.pixels.length} pixels, ${state.zones.length} zones)`,
-    );
-  }
-  return buildState(hubId);
 }
 
 // ── Admin helpers ─────────────────────────────────────────────────────────────
@@ -552,7 +491,6 @@ function startServer() {
         JSON.stringify({
           ok: true,
           loadedHubs: [...loadedHubs],
-          nonExistentHubs: [...nonExistentHubs],
           pixelCounts: Object.fromEntries(
             [...pixelBuffer.entries()].map(([k, v]) => [k, v.size]),
           ),
@@ -612,10 +550,8 @@ function startServer() {
     pingTimeout: 25_000,
   });
 
-  // ── Socket middleware ──────────────────────────────────────────────────────
   io.use(async (socket, next) => {
-    const { user_id, username, hub_id, access_code } =
-      socket.handshake.auth || {};
+    const { user_id, username, hub_id } = socket.handshake.auth || {};
     if (!user_id || !username) return next(new Error("auth_required"));
 
     socket.userId = String(user_id);
@@ -623,27 +559,11 @@ function startServer() {
     socket.hubId = String(hub_id || "public").substring(0, 64);
     socket.isAdmin = await resolveAdmin(user_id);
 
-    // ── Check hub exists AND access code is correct ───────────────────────
-    const access = await checkHubAccess(
-      socket.hubId,
-      access_code,
-      socket.isAdmin,
-    );
-
-    if (access === "not_found") {
-      console.log(`[neurohub] Rejected: hub "${socket.hubId}" not found`);
+    const hubExists = await initHubIfNeeded(socket.hubId);
+    if (!hubExists) {
       return next(new Error("hub_not_found"));
     }
 
-    if (access === "access_denied") {
-      console.log(
-        `[neurohub] Rejected: wrong/missing access code for hub "${socket.hubId}"`,
-      );
-      return next(new Error("access_denied"));
-    }
-
-    // Access granted — now load hub data into RAM if needed
-    await initHubIfNeeded(socket.hubId);
     next();
   });
 
@@ -662,7 +582,6 @@ function startServer() {
     });
     io.to(hubId).emit("presence_list", presenceList(hubId));
 
-    // ── pixel ──────────────────────────────────────────────────────────────
     socket.on("pixel", (data) => {
       const x = parseInt(data.x),
         y = parseInt(data.y);
@@ -718,7 +637,6 @@ function startServer() {
       if (buf.size >= FLUSH_BATCH) flushPixels(hubId).catch(console.error);
     });
 
-    // ── chat ───────────────────────────────────────────────────────────────
     socket.on("chat", async (data) => {
       const message = String(data.message || "")
         .trim()
@@ -737,7 +655,6 @@ function startServer() {
       } catch (_) {}
     });
 
-    // ── move ───────────────────────────────────────────────────────────────
     socket.on("move", (data) => {
       const x = Math.max(0, Math.min(WORLD_W, parseInt(data.x) || WORLD_W / 2));
       const y = Math.max(0, Math.min(WORLD_H, parseInt(data.y) || WORLD_H / 2));
@@ -749,7 +666,6 @@ function startServer() {
       socket.to(hubId).emit("move", { user_id: userId, username, x, y });
     });
 
-    // ── bubble_save ────────────────────────────────────────────────────────
     socket.on("bubble_save", async (data, ack) => {
       const type = data.type === "emotion" ? "emotion" : "brain";
       const x = Math.max(0, parseInt(data.x) || 100);
@@ -815,7 +731,6 @@ function startServer() {
       }
     });
 
-    // ── bubble_move ────────────────────────────────────────────────────────
     socket.on("bubble_move", async (data) => {
       const id = parseInt(data.id),
         x = parseInt(data.x),
@@ -836,7 +751,6 @@ function startServer() {
       } catch (_) {}
     });
 
-    // ── bubble_edit ────────────────────────────────────────────────────────
     socket.on("bubble_edit", async (data) => {
       const id = parseInt(data.id);
       const b = bubbleCache.get(hubId)?.get(id);
@@ -868,7 +782,6 @@ function startServer() {
       io.to(hubId).emit("bubble_update", b);
     });
 
-    // ── bubble_delete ──────────────────────────────────────────────────────
     socket.on("bubble_delete", async (data) => {
       const id = parseInt(data.id);
       if (isNaN(id)) return;
@@ -889,7 +802,6 @@ function startServer() {
       } catch (_) {}
     });
 
-    // ── zone_add ───────────────────────────────────────────────────────────
     socket.on("zone_add", async (data, ack) => {
       if (!isAdmin) {
         if (typeof ack === "function") ack({ ok: false, reason: "not_admin" });
@@ -939,7 +851,6 @@ function startServer() {
       }
     });
 
-    // ── zone_delete ────────────────────────────────────────────────────────
     socket.on("zone_delete", async (data, ack) => {
       if (!isAdmin) {
         if (typeof ack === "function") ack({ ok: false, reason: "not_admin" });
@@ -986,7 +897,6 @@ function startServer() {
       }
     });
 
-    // ── disconnect ─────────────────────────────────────────────────────────
     socket.on("disconnect", () => {
       getPresence(hubId).delete(socket.id);
       io.to(hubId).emit("presence_list", presenceList(hubId));
@@ -994,11 +904,8 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.5 listening on :${PORT}`);
+    console.log(`[neurohub] v6.4 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
-    console.log(
-      `[neurohub] Private hubs require access_code on every connect.`,
-    );
   });
 }
 
