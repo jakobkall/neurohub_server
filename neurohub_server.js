@@ -1,7 +1,18 @@
 /**
- * neurohub_server.js — v6.4
+ * neurohub_server.js — v6.5
  *
- * CHANGES:
+ * CHANGES vs v6.4:
+ * - Added a "branch_add" socket handler for connecting two bubbles that
+ *   ALREADY exist (used by the frontend's press-and-drag "+" connect,
+ *   e.g. dragging an existing thought bubble onto an existing emotion
+ *   bubble). Validates both bubble ids belong to the hub, rejects
+ *   self-loops, treats an already-existing edge (either direction) as a
+ *   harmless no-op success, persists to nh_branches, updates the in-RAM
+ *   branchCache, and broadcasts "branch_add" to the hub room — mirroring
+ *   the branch_add emit that bubble_save already does when a brand-new
+ *   bubble is created with a parent_id.
+ *
+ * CHANGES vs v6.3:
  * - Automatically copies defaults from `nh_hub_defaults` if a hub is loaded
  * for the first time and is completely empty.
  */
@@ -802,6 +813,56 @@ function startServer() {
       } catch (_) {}
     });
 
+    // Connects two bubbles that ALREADY exist (e.g. dragging the "+" handle
+    // on an existing thought bubble and dropping it onto an existing
+    // emotion bubble) — as opposed to bubble_save's parent_id, which wires
+    // up a brand-new bubble to a parent at creation time. Emitted by the
+    // frontend's connectExistingBubbles(). No admin check, same as
+    // bubble_save/bubble_edit/bubble_delete — any connected user can link
+    // two bubbles they can already see.
+    socket.on("branch_add", async (data, ack) => {
+      const parentId = parseInt(data.parent_id);
+      const childId = parseInt(data.child_id);
+      if (isNaN(parentId) || isNaN(childId) || parentId === childId) {
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "invalid_ids" });
+        return;
+      }
+
+      const bubbles = bubbleCache.get(hubId);
+      if (!bubbles || !bubbles.has(parentId) || !bubbles.has(childId)) {
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "bubble_not_found" });
+        return;
+      }
+
+      const bc = branchCache.get(hubId);
+      const key1 = `${parentId}-${childId}`;
+      const key2 = `${childId}-${parentId}`;
+      if (bc && (bc.has(key1) || bc.has(key2))) {
+        // Already connected (either direction) — treat as a harmless no-op
+        // success rather than an error.
+        if (typeof ack === "function") ack({ ok: true, already: true });
+        return;
+      }
+
+      try {
+        await pool.execute(
+          "INSERT IGNORE INTO nh_branches (hub_id,parent_id,child_id) VALUES (?,?,?)",
+          [hubId, parentId, childId],
+        );
+        bc.add(key1);
+        io.to(hubId).emit("branch_add", {
+          parent_id: parentId,
+          child_id: childId,
+        });
+        if (typeof ack === "function") ack({ ok: true });
+      } catch (e) {
+        console.error("[neurohub] branch_add:", e.message);
+        if (typeof ack === "function") ack({ ok: false });
+      }
+    });
+
     socket.on("zone_add", async (data, ack) => {
       if (!isAdmin) {
         if (typeof ack === "function") ack({ ok: false, reason: "not_admin" });
@@ -904,7 +965,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.4 listening on :${PORT}`);
+    console.log(`[neurohub] v6.5 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
