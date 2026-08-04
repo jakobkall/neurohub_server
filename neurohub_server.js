@@ -113,6 +113,17 @@ async function bootstrap() {
   await warmUp();
   setInterval(flushAllPixels, FLUSH_INTERVAL);
   startServer();
+
+  // Schema extensions
+  for (const sql of [
+    "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
+    "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked_by_zone TINYINT(1) NOT NULL DEFAULT 0",
+    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS emotion_icon_id INT NULL DEFAULT NULL",
+  ]) {
+    try {
+      await pool.execute(sql);
+    } catch (_) {}
+  }
 }
 
 // ── Warm-up ───────────────────────────────────────────────────────────────────
@@ -182,6 +193,15 @@ async function warmUp() {
   loadedHubs.add("public");
   ensureHubBuffers("public");
   console.log("[neurohub] Warm-up complete");
+
+  const [bubbles] = await pool.query(
+    "SELECT id,hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,user_id,username FROM nh_bubbles",
+  );
+  bubbles.forEach((b) => {
+    loadedHubs.add(b.hub_id);
+    ensureHubBuffers(b.hub_id);
+    bubbleCache.get(b.hub_id).set(b.id, { ...b });
+  });
 }
 
 function ensureHubBuffers(hubId) {
@@ -688,13 +708,23 @@ function startServer() {
         type === "brain" ? String(data.content || "").substring(0, 500) : null;
       const emotion =
         type === "emotion" ? String(data.emotion || "").substring(0, 64) : null;
+
+      // FIX: 0 skal kunne gemmes — Number.isFinite i stedet for `|| 5`
+      const rawVal = parseInt(data.emotion_val, 10);
       const emotionVal =
         type === "emotion"
-          ? Math.min(10, Math.max(1, parseInt(data.emotion_val) || 5))
+          ? Number.isFinite(rawVal)
+            ? Math.min(10, Math.max(0, rawVal))
+            : 5
           : null;
+
+      const rawIconId = parseInt(data.emotion_icon_id, 10);
+      const emotionIconId =
+        type === "emotion" && Number.isFinite(rawIconId) ? rawIconId : null;
+
       try {
         const [res] = await pool.execute(
-          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
           [
             hubId,
             type,
@@ -704,6 +734,7 @@ function startServer() {
             content,
             emotion,
             emotionVal,
+            emotionIconId,
             userId,
             username,
           ],
@@ -730,6 +761,7 @@ function startServer() {
           content,
           emotion,
           emotion_val: emotionVal,
+          emotion_icon_id: emotionIconId,
           username,
           user_id: userId,
         };
@@ -769,15 +801,22 @@ function startServer() {
       if (b.type === "emotion") {
         if (data.emotion !== undefined)
           b.emotion = String(data.emotion).substring(0, 64);
-        if (data.emotion_val !== undefined)
-          b.emotion_val = Math.min(
-            10,
-            Math.max(1, parseInt(data.emotion_val) || 5),
-          );
+
+        // FIX: samme 0-bug som i bubble_save
+        if (data.emotion_val !== undefined) {
+          const parsed = parseInt(data.emotion_val, 10);
+          b.emotion_val = Number.isFinite(parsed)
+            ? Math.min(10, Math.max(0, parsed))
+            : 5;
+        }
+        if (data.emotion_icon_id !== undefined) {
+          const parsedIcon = parseInt(data.emotion_icon_id, 10);
+          b.emotion_icon_id = Number.isFinite(parsedIcon) ? parsedIcon : null;
+        }
         try {
           await pool.execute(
-            "UPDATE nh_bubbles SET emotion=?,emotion_val=? WHERE id=?",
-            [b.emotion, b.emotion_val, id],
+            "UPDATE nh_bubbles SET emotion=?,emotion_val=?,emotion_icon_id=? WHERE id=?",
+            [b.emotion, b.emotion_val, b.emotion_icon_id ?? null, id],
           );
         } catch (_) {}
       } else {
