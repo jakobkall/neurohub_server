@@ -1,5 +1,23 @@
 /**
- * neurohub_server.js — v6.5
+ * neurohub_server.js — v6.6
+ *
+ * CHANGES vs v6.5:
+ * - FIXED FATAL BUG: warmUp() had two `const [bubbles] = ...` declarations
+ *   in the same function scope. This is a JavaScript SyntaxError
+ *   ("Identifier 'bubbles' has already been declared") — Node.js cannot
+ *   even parse the file, so the process crashes on every start/restart.
+ *   This is why the frontend saw "nothing loads from server" — the server
+ *   was never actually running. Merged into a single query that includes
+ *   emotion_icon_id.
+ * - FIXED: bootstrap() had the schema-extension migration loop duplicated,
+ *   with the second copy running AFTER startServer() had already been
+ *   called (and after warmUp() had already read from nh_bubbles). Merged
+ *   into a single migration block that runs once, fully, before warmUp().
+ * - emotion_icon_id is now added to nh_bubbles via migration, selected in
+ *   warmUp()/_doInitHub(), and read/written by bubble_save/bubble_edit, so
+ *   emotion icons persist correctly across reloads and for other users.
+ * - bubble_save/bubble_edit now allow emotion_val = 0 (previously
+ *   `parseInt(...) || 5` treated 0 as falsy and silently replaced it with 5).
  *
  * CHANGES vs v6.4:
  * - Added a "branch_add" socket handler for connecting two bubbles that
@@ -89,10 +107,11 @@ async function bootstrap() {
     console.error("[neurohub] WARNING: Cannot read users table:", e.message);
   }
 
-  // Schema extensions
+  // Schema extensions — runs ONCE, fully, before warmUp() reads nh_bubbles.
   for (const sql of [
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked_by_zone TINYINT(1) NOT NULL DEFAULT 0",
+    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS emotion_icon_id INT NULL DEFAULT NULL",
   ]) {
     try {
       await pool.execute(sql);
@@ -113,17 +132,6 @@ async function bootstrap() {
   await warmUp();
   setInterval(flushAllPixels, FLUSH_INTERVAL);
   startServer();
-
-  // Schema extensions
-  for (const sql of [
-    "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked_by_zone TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS emotion_icon_id INT NULL DEFAULT NULL",
-  ]) {
-    try {
-      await pool.execute(sql);
-    } catch (_) {}
-  }
 }
 
 // ── Warm-up ───────────────────────────────────────────────────────────────────
@@ -146,7 +154,7 @@ async function warmUp() {
   });
 
   const [bubbles] = await pool.query(
-    "SELECT id,hub_id,type,x,y,color,content,emotion,emotion_val,user_id,username FROM nh_bubbles",
+    "SELECT id,hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,user_id,username FROM nh_bubbles",
   );
   bubbles.forEach((b) => {
     loadedHubs.add(b.hub_id);
@@ -193,15 +201,6 @@ async function warmUp() {
   loadedHubs.add("public");
   ensureHubBuffers("public");
   console.log("[neurohub] Warm-up complete");
-
-  const [bubbles] = await pool.query(
-    "SELECT id,hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,user_id,username FROM nh_bubbles",
-  );
-  bubbles.forEach((b) => {
-    loadedHubs.add(b.hub_id);
-    ensureHubBuffers(b.hub_id);
-    bubbleCache.get(b.hub_id).set(b.id, { ...b });
-  });
 }
 
 function ensureHubBuffers(hubId) {
@@ -337,7 +336,7 @@ async function _doInitHub(hubId) {
       });
     });
 
-    // Load bubbles
+    // Load bubbles (SELECT * automatically picks up emotion_icon_id)
     const [bubbles] = await pool.query(
       "SELECT * FROM nh_bubbles WHERE hub_id = ?",
       [hubId],
@@ -709,7 +708,7 @@ function startServer() {
       const emotion =
         type === "emotion" ? String(data.emotion || "").substring(0, 64) : null;
 
-      // FIX: 0 skal kunne gemmes — Number.isFinite i stedet for `|| 5`
+      // 0 skal kunne gemmes — Number.isFinite i stedet for `|| 5`
       const rawVal = parseInt(data.emotion_val, 10);
       const emotionVal =
         type === "emotion"
@@ -802,7 +801,7 @@ function startServer() {
         if (data.emotion !== undefined)
           b.emotion = String(data.emotion).substring(0, 64);
 
-        // FIX: samme 0-bug som i bubble_save
+        // 0 skal kunne gemmes — samme fix som i bubble_save
         if (data.emotion_val !== undefined) {
           const parsed = parseInt(data.emotion_val, 10);
           b.emotion_val = Number.isFinite(parsed)
@@ -1004,7 +1003,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.5 listening on :${PORT}`);
+    console.log(`[neurohub] v6.6 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
