@@ -1,7 +1,36 @@
 /**
- * neurohub_server.js — v6.4
+ * neurohub_server.js — v6.6
  *
- * CHANGES:
+ * CHANGES vs v6.5:
+ * - FIXED FATAL BUG: warmUp() had two `const [bubbles] = ...` declarations
+ *   in the same function scope. This is a JavaScript SyntaxError
+ *   ("Identifier 'bubbles' has already been declared") — Node.js cannot
+ *   even parse the file, so the process crashes on every start/restart.
+ *   This is why the frontend saw "nothing loads from server" — the server
+ *   was never actually running. Merged into a single query that includes
+ *   emotion_icon_id.
+ * - FIXED: bootstrap() had the schema-extension migration loop duplicated,
+ *   with the second copy running AFTER startServer() had already been
+ *   called (and after warmUp() had already read from nh_bubbles). Merged
+ *   into a single migration block that runs once, fully, before warmUp().
+ * - emotion_icon_id is now added to nh_bubbles via migration, selected in
+ *   warmUp()/_doInitHub(), and read/written by bubble_save/bubble_edit, so
+ *   emotion icons persist correctly across reloads and for other users.
+ * - bubble_save/bubble_edit now allow emotion_val = 0 (previously
+ *   `parseInt(...) || 5` treated 0 as falsy and silently replaced it with 5).
+ *
+ * CHANGES vs v6.4:
+ * - Added a "branch_add" socket handler for connecting two bubbles that
+ *   ALREADY exist (used by the frontend's press-and-drag "+" connect,
+ *   e.g. dragging an existing thought bubble onto an existing emotion
+ *   bubble). Validates both bubble ids belong to the hub, rejects
+ *   self-loops, treats an already-existing edge (either direction) as a
+ *   harmless no-op success, persists to nh_branches, updates the in-RAM
+ *   branchCache, and broadcasts "branch_add" to the hub room — mirroring
+ *   the branch_add emit that bubble_save already does when a brand-new
+ *   bubble is created with a parent_id.
+ *
+ * CHANGES vs v6.3:
  * - Automatically copies defaults from `nh_hub_defaults` if a hub is loaded
  * for the first time and is completely empty.
  */
@@ -78,10 +107,11 @@ async function bootstrap() {
     console.error("[neurohub] WARNING: Cannot read users table:", e.message);
   }
 
-  // Schema extensions
+  // Schema extensions — runs ONCE, fully, before warmUp() reads nh_bubbles.
   for (const sql of [
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked_by_zone TINYINT(1) NOT NULL DEFAULT 0",
+    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS emotion_icon_id INT NULL DEFAULT NULL",
   ]) {
     try {
       await pool.execute(sql);
@@ -124,7 +154,7 @@ async function warmUp() {
   });
 
   const [bubbles] = await pool.query(
-    "SELECT id,hub_id,type,x,y,color,content,emotion,emotion_val,user_id,username FROM nh_bubbles",
+    "SELECT id,hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,user_id,username FROM nh_bubbles",
   );
   bubbles.forEach((b) => {
     loadedHubs.add(b.hub_id);
@@ -306,7 +336,7 @@ async function _doInitHub(hubId) {
       });
     });
 
-    // Load bubbles
+    // Load bubbles (SELECT * automatically picks up emotion_icon_id)
     const [bubbles] = await pool.query(
       "SELECT * FROM nh_bubbles WHERE hub_id = ?",
       [hubId],
@@ -677,13 +707,23 @@ function startServer() {
         type === "brain" ? String(data.content || "").substring(0, 500) : null;
       const emotion =
         type === "emotion" ? String(data.emotion || "").substring(0, 64) : null;
+
+      // 0 skal kunne gemmes — Number.isFinite i stedet for `|| 5`
+      const rawVal = parseInt(data.emotion_val, 10);
       const emotionVal =
         type === "emotion"
-          ? Math.min(10, Math.max(1, parseInt(data.emotion_val) || 5))
+          ? Number.isFinite(rawVal)
+            ? Math.min(10, Math.max(0, rawVal))
+            : 5
           : null;
+
+      const rawIconId = parseInt(data.emotion_icon_id, 10);
+      const emotionIconId =
+        type === "emotion" && Number.isFinite(rawIconId) ? rawIconId : null;
+
       try {
         const [res] = await pool.execute(
-          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
           [
             hubId,
             type,
@@ -693,6 +733,7 @@ function startServer() {
             content,
             emotion,
             emotionVal,
+            emotionIconId,
             userId,
             username,
           ],
@@ -719,6 +760,7 @@ function startServer() {
           content,
           emotion,
           emotion_val: emotionVal,
+          emotion_icon_id: emotionIconId,
           username,
           user_id: userId,
         };
@@ -758,15 +800,22 @@ function startServer() {
       if (b.type === "emotion") {
         if (data.emotion !== undefined)
           b.emotion = String(data.emotion).substring(0, 64);
-        if (data.emotion_val !== undefined)
-          b.emotion_val = Math.min(
-            10,
-            Math.max(1, parseInt(data.emotion_val) || 5),
-          );
+
+        // 0 skal kunne gemmes — samme fix som i bubble_save
+        if (data.emotion_val !== undefined) {
+          const parsed = parseInt(data.emotion_val, 10);
+          b.emotion_val = Number.isFinite(parsed)
+            ? Math.min(10, Math.max(0, parsed))
+            : 5;
+        }
+        if (data.emotion_icon_id !== undefined) {
+          const parsedIcon = parseInt(data.emotion_icon_id, 10);
+          b.emotion_icon_id = Number.isFinite(parsedIcon) ? parsedIcon : null;
+        }
         try {
           await pool.execute(
-            "UPDATE nh_bubbles SET emotion=?,emotion_val=? WHERE id=?",
-            [b.emotion, b.emotion_val, id],
+            "UPDATE nh_bubbles SET emotion=?,emotion_val=?,emotion_icon_id=? WHERE id=?",
+            [b.emotion, b.emotion_val, b.emotion_icon_id ?? null, id],
           );
         } catch (_) {}
       } else {
@@ -800,6 +849,56 @@ function startServer() {
           [id, id],
         );
       } catch (_) {}
+    });
+
+    // Connects two bubbles that ALREADY exist (e.g. dragging the "+" handle
+    // on an existing thought bubble and dropping it onto an existing
+    // emotion bubble) — as opposed to bubble_save's parent_id, which wires
+    // up a brand-new bubble to a parent at creation time. Emitted by the
+    // frontend's connectExistingBubbles(). No admin check, same as
+    // bubble_save/bubble_edit/bubble_delete — any connected user can link
+    // two bubbles they can already see.
+    socket.on("branch_add", async (data, ack) => {
+      const parentId = parseInt(data.parent_id);
+      const childId = parseInt(data.child_id);
+      if (isNaN(parentId) || isNaN(childId) || parentId === childId) {
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "invalid_ids" });
+        return;
+      }
+
+      const bubbles = bubbleCache.get(hubId);
+      if (!bubbles || !bubbles.has(parentId) || !bubbles.has(childId)) {
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "bubble_not_found" });
+        return;
+      }
+
+      const bc = branchCache.get(hubId);
+      const key1 = `${parentId}-${childId}`;
+      const key2 = `${childId}-${parentId}`;
+      if (bc && (bc.has(key1) || bc.has(key2))) {
+        // Already connected (either direction) — treat as a harmless no-op
+        // success rather than an error.
+        if (typeof ack === "function") ack({ ok: true, already: true });
+        return;
+      }
+
+      try {
+        await pool.execute(
+          "INSERT IGNORE INTO nh_branches (hub_id,parent_id,child_id) VALUES (?,?,?)",
+          [hubId, parentId, childId],
+        );
+        bc.add(key1);
+        io.to(hubId).emit("branch_add", {
+          parent_id: parentId,
+          child_id: childId,
+        });
+        if (typeof ack === "function") ack({ ok: true });
+      } catch (e) {
+        console.error("[neurohub] branch_add:", e.message);
+        if (typeof ack === "function") ack({ ok: false });
+      }
     });
 
     socket.on("zone_add", async (data, ack) => {
@@ -904,7 +1003,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.4 listening on :${PORT}`);
+    console.log(`[neurohub] v6.6 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
