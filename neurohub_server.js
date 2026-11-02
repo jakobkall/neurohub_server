@@ -1,28 +1,28 @@
 /**
- * neurohub_server.js — v6.7
+ * neurohub_server.js — v6.8
  *
- * CHANGES vs v6.6:
- * - NY: nh_bubbles.size_scale (FLOAT, default 1) — bobler kan nu have en
- *   individuel størrelse (0.5–3.0). Tilføjes via migration, gemmes i
- *   bubble_save, kan ændres via bubble_edit og sendes med i state/bubble_update.
- * - NY: bubble_edit understøtter nu `color` (#rrggbb) og `size_scale` for
- *   BÅDE thought- og emotion-bobler. UPDATE bygges dynamisk, så kun de felter
- *   der faktisk blev sendt, bliver skrevet.
- * - NY: "branch_delete" socket-handler — sletter en enkelt forbindelse mellem
- *   to bobler (begge retninger), opdaterer RAM-cache + DB og broadcaster
- *   "branch_delete" til hub-rummet.
- * - DB-adgangskoden står IKKE længere hardcoded i filen. Sæt DB_PASS (og
- *   evt. DB_HOST/DB_USER/DB_NAME/USERS_DB_NAME) i din .env.
- * - warmUp() henter bobler med SELECT * så serveren ikke crasher hvis
- *   migrationen af en ny kolonne endnu ikke er kørt.
- * - bubble_move / bubble_delete / bubble_edit begrænser nu også på hub_id i SQL.
+ * CHANGES vs v6.7:
+ * - ERSTATTET size_scale med to uafhængige mål: nh_bubbles.size_w og
+ *   nh_bubbles.size_h (INT NULL, i pixels). NULL = "auto" (boblen
+ *   dimensionerer sig selv efter indholdet). Bredde og højde kan altså nu
+ *   ændres hver for sig. Den gamle size_scale-kolonne ignoreres.
+ * - bubble_save / bubble_edit accepterer size_w og size_h. Send `null` for at
+ *   nulstille til auto. Værdier clampes (bredde 60–1000, højde 40–800).
+ * - bubble_edit opdaterer kun de felter der faktisk blev sendt
+ *   (color, size_w, size_h, emotion, emotion_val, emotion_icon_id, content).
  *
- * Hvis din MySQL-version ikke understøtter "ADD COLUMN IF NOT EXISTS", så kør
- * manuelt:
- *   ALTER TABLE nh_bubbles ADD COLUMN size_scale FLOAT NOT NULL DEFAULT 1;
+ * VIGTIGT: Genstart serveren efter opdatering. Kører du stadig en ældre
+ * version, ignorerer den "color" i bubble_edit og broadcaster den gamle farve
+ * tilbage til alle klienter — det ser ud som om boblen "skifter tilbage".
+ * Tjek versionen på /health (skal vise "6.8").
  *
- * (Ældre changelog: se v6.6 — duplikeret const [bubbles] fix, emotion_icon_id,
- *  branch_add, default-kopiering fra nh_hub_defaults.)
+ * Hvis din MySQL ikke understøtter "ADD COLUMN IF NOT EXISTS", så kør manuelt:
+ *   ALTER TABLE nh_bubbles ADD COLUMN size_w INT NULL DEFAULT NULL;
+ *   ALTER TABLE nh_bubbles ADD COLUMN size_h INT NULL DEFAULT NULL;
+ *
+ * (Ældre changelog: v6.7 — branch_delete, color i bubble_edit, DB_PASS fra
+ *  .env. v6.6 — duplikeret const [bubbles] fix, emotion_icon_id, branch_add,
+ *  default-kopiering fra nh_hub_defaults.)
  */
 "use strict";
 
@@ -80,14 +80,31 @@ const FLUSH_BATCH = 200;
 const WORLD_W = 4000,
   WORLD_H = 2800;
 
-const MIN_SCALE = 0.5;
-const MAX_SCALE = 3.0;
+const MIN_BUBBLE_W = 60;
+const MAX_BUBBLE_W = 1000;
+const MIN_BUBBLE_H = 40;
+const MAX_BUBBLE_H = 800;
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 
-function clampScale(v, fallback = 1) {
-  const n = parseFloat(v);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.round(Math.min(MAX_SCALE, Math.max(MIN_SCALE, n)) * 100) / 100;
+// null  → nulstil til auto
+// tal   → clampet heltal
+// ugyldigt → undefined (ignoreres)
+function parseDim(v, min, max) {
+  if (v === null) return null;
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n)) return undefined;
+  return Math.min(max, Math.max(min, n));
+}
+
+// Ensartet form på bobler fra DB: size_w/size_h er tal eller null, og den
+// gamle size_scale-kolonne følger ikke med ud til klienterne.
+function normalizeBubbleRow(b) {
+  const { size_scale, ...rest } = b;
+  return {
+    ...rest,
+    size_w: rest.size_w == null ? null : Number(rest.size_w),
+    size_h: rest.size_h == null ? null : Number(rest.size_h),
+  };
 }
 
 let pool;
@@ -112,11 +129,14 @@ async function bootstrap() {
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked_by_zone TINYINT(1) NOT NULL DEFAULT 0",
     "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS emotion_icon_id INT NULL DEFAULT NULL",
-    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS size_scale FLOAT NOT NULL DEFAULT 1",
+    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS size_w INT NULL DEFAULT NULL",
+    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS size_h INT NULL DEFAULT NULL",
   ]) {
     try {
       await pool.execute(sql);
-    } catch (_) {}
+    } catch (e) {
+      console.warn("[neurohub] migration skipped:", sql, "→", e.message);
+    }
   }
   try {
     await pool.execute(
@@ -154,7 +174,7 @@ async function warmUp() {
     });
   });
 
-  // SELECT * så size_scale / emotion_icon_id automatisk følger med
+  // SELECT * så size_w / size_h / emotion_icon_id automatisk følger med
   const [bubbles] = await pool.query("SELECT * FROM nh_bubbles");
   bubbles.forEach((b) => {
     loadedHubs.add(b.hub_id);
@@ -201,11 +221,6 @@ async function warmUp() {
   loadedHubs.add("public");
   ensureHubBuffers("public");
   console.log("[neurohub] Warm-up complete");
-}
-
-// Sørger for at size_scale altid er et tal (default 1), uanset DB-version
-function normalizeBubbleRow(b) {
-  return { ...b, size_scale: clampScale(b.size_scale, 1) };
 }
 
 function ensureHubBuffers(hubId) {
@@ -341,7 +356,7 @@ async function _doInitHub(hubId) {
       });
     });
 
-    // Load bubbles (SELECT * picks up emotion_icon_id + size_scale)
+    // Load bubbles (SELECT * picks up emotion_icon_id + size_w + size_h)
     const [bubbles] = await pool.query(
       "SELECT * FROM nh_bubbles WHERE hub_id = ?",
       [hubId],
@@ -527,6 +542,7 @@ function startServer() {
       return res.end(
         JSON.stringify({
           ok: true,
+          version: "6.8",
           loadedHubs: [...loadedHubs],
           pixelCounts: Object.fromEntries(
             [...pixelBuffer.entries()].map(([k, v]) => [k, v.size]),
@@ -714,7 +730,11 @@ function startServer() {
         type === "brain" ? String(data.content || "").substring(0, 500) : null;
       const emotion =
         type === "emotion" ? String(data.emotion || "").substring(0, 64) : null;
-      const sizeScale = clampScale(data.size_scale, 1);
+      // undefined (ikke sendt) → null (auto)
+      const sizeW =
+        parseDim(data.size_w ?? null, MIN_BUBBLE_W, MAX_BUBBLE_W) ?? null;
+      const sizeH =
+        parseDim(data.size_h ?? null, MIN_BUBBLE_H, MAX_BUBBLE_H) ?? null;
 
       // 0 skal kunne gemmes — Number.isFinite i stedet for `|| 5`
       const rawVal = parseInt(data.emotion_val, 10);
@@ -731,7 +751,7 @@ function startServer() {
 
       try {
         const [res] = await pool.execute(
-          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,size_scale,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,size_w,size_h,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
           [
             hubId,
             type,
@@ -742,7 +762,8 @@ function startServer() {
             emotion,
             emotionVal,
             emotionIconId,
-            sizeScale,
+            sizeW,
+            sizeH,
             userId,
             username,
           ],
@@ -770,7 +791,8 @@ function startServer() {
           emotion,
           emotion_val: emotionVal,
           emotion_icon_id: emotionIconId,
-          size_scale: sizeScale,
+          size_w: sizeW,
+          size_h: sizeH,
           username,
           user_id: userId,
         };
@@ -802,7 +824,7 @@ function startServer() {
     });
 
     // bubble_edit — opdaterer kun de felter der faktisk er sendt:
-    //   color, size_scale  (alle bobler)
+    //   color, size_w, size_h  (alle bobler; size_* = null nulstiller til auto)
     //   emotion, emotion_val, emotion_icon_id  (emotion-bobler)
     //   content  (thought-bobler)
     socket.on("bubble_edit", async (data) => {
@@ -820,10 +842,21 @@ function startServer() {
         vals.push(b.color);
       }
 
-      if (data.size_scale !== undefined) {
-        b.size_scale = clampScale(data.size_scale, b.size_scale ?? 1);
-        sets.push("size_scale=?");
-        vals.push(b.size_scale);
+      if (data.size_w !== undefined) {
+        const w = parseDim(data.size_w, MIN_BUBBLE_W, MAX_BUBBLE_W);
+        if (w !== undefined) {
+          b.size_w = w;
+          sets.push("size_w=?");
+          vals.push(w);
+        }
+      }
+      if (data.size_h !== undefined) {
+        const h = parseDim(data.size_h, MIN_BUBBLE_H, MAX_BUBBLE_H);
+        if (h !== undefined) {
+          b.size_h = h;
+          sets.push("size_h=?");
+          vals.push(h);
+        }
       }
 
       if (b.type === "emotion") {
@@ -1071,7 +1104,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.7 listening on :${PORT}`);
+    console.log(`[neurohub] v6.8 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
