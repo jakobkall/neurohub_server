@@ -1,28 +1,29 @@
 /**
- * neurohub_server.js — v6.8
+ * neurohub_server.js — v6.9  (performance + datastruktur)
  *
- * CHANGES vs v6.7:
- * - ERSTATTET size_scale med to uafhængige mål: nh_bubbles.size_w og
- *   nh_bubbles.size_h (INT NULL, i pixels). NULL = "auto" (boblen
- *   dimensionerer sig selv efter indholdet). Bredde og højde kan altså nu
- *   ændres hver for sig. Den gamle size_scale-kolonne ignoreres.
- * - bubble_save / bubble_edit accepterer size_w og size_h. Send `null` for at
- *   nulstille til auto. Værdier clampes (bredde 60–1000, højde 40–800).
- * - bubble_edit opdaterer kun de felter der faktisk blev sendt
- *   (color, size_w, size_h, emotion, emotion_val, emotion_icon_id, content).
+ * CHANGES vs v6.8:
+ * - ROD-ÅRSAG TIL LAG RETTET: pixel-handleren kaldte flushPixels() for HELE
+ *   hubben (alle pixels, upsert af hver eneste række) for hver eneste pixel,
+ *   så snart hubben havde ≥200 pixels (`buf.size >= FLUSH_BATCH` talte alle
+ *   pixels, ikke de ændrede). Det spærrede DB-poolen og event-loopet, så alt
+ *   andet (fx nye bobler) kom til at vente. Nu holdes en "dirty"-mængde pr.
+ *   hub, og kun ændrede pixels skrives (batchet). Sletninger sendes som ét
+ *   batchet DELETE ... IN (...). Kun én flush ad gangen pr. hub.
+ * - NY: "pixels"-event (batch). Klienten samler pixels og sender dem som én
+ *   pakke; serveren validerer alle og broadcaster ÉN pakke til de andre.
+ *   Afsenderen får ikke sine egne pixels retur (de er allerede tegnet).
+ *   Det gamle enkelt-"pixel"-event virker stadig (bruger samme logik).
+ * - bubble_save: svarer (ack) med den færdige boble med det samme efter
+ *   INSERT, og broadcaster til de ANDRE. Forbindelsen til forælder gemmes
+ *   i DB bagefter. Opretteren får altså ikke længere en dublet-boble retur.
+ *   Ugyldigt parent_id ignoreres i stedet for at vælte hele kaldet.
+ * - bubble_edit / branch_add / branch_delete broadcaster kun til de ANDRE
+ *   (afsenderen har allerede ændret lokalt — et ekko kunne overskrive nyere
+ *   værdier midt i et slider-træk).
+ * - bubble_move accepterer { final:false } for live-bevægelse (broadcast
+ *   uden DB-skrivning); DB opdateres kun ved final (default).
  *
- * VIGTIGT: Genstart serveren efter opdatering. Kører du stadig en ældre
- * version, ignorerer den "color" i bubble_edit og broadcaster den gamle farve
- * tilbage til alle klienter — det ser ud som om boblen "skifter tilbage".
- * Tjek versionen på /health (skal vise "6.8").
- *
- * Hvis din MySQL ikke understøtter "ADD COLUMN IF NOT EXISTS", så kør manuelt:
- *   ALTER TABLE nh_bubbles ADD COLUMN size_w INT NULL DEFAULT NULL;
- *   ALTER TABLE nh_bubbles ADD COLUMN size_h INT NULL DEFAULT NULL;
- *
- * (Ældre changelog: v6.7 — branch_delete, color i bubble_edit, DB_PASS fra
- *  .env. v6.6 — duplikeret const [bubbles] fix, emotion_icon_id, branch_add,
- *  default-kopiering fra nh_hub_defaults.)
+ * (v6.8: size_w/size_h. v6.7: branch_delete, color. v6.6: m.fl.)
  */
 "use strict";
 
@@ -71,6 +72,8 @@ const chatCache = new Map();
 const presence = new Map();
 const zoneCache = new Map();
 const adminCache = new Map();
+const dirtyKeys = new Map(); // hubId -> Set("x,y") af pixels der skal skrives til DB
+const flushing = new Set(); // hubIds hvor en flush kører lige nu
 
 const loadedHubs = new Set();
 const initPromises = new Map();
@@ -79,6 +82,10 @@ const FLUSH_INTERVAL = 20_000;
 const FLUSH_BATCH = 200;
 const WORLD_W = 4000,
   WORLD_H = 2800;
+const PIXEL_CELL = 12;
+const MAX_CX = Math.floor(WORLD_W / PIXEL_CELL);
+const MAX_CY = Math.floor(WORLD_H / PIXEL_CELL);
+const MAX_PIXEL_OPS_PER_BATCH = 1000;
 
 const MIN_BUBBLE_W = 60;
 const MAX_BUBBLE_W = 1000;
@@ -226,6 +233,7 @@ async function warmUp() {
 function ensureHubBuffers(hubId) {
   if (!pixelBuffer.has(hubId)) pixelBuffer.set(hubId, new Map());
   if (!erasedKeys.has(hubId)) erasedKeys.set(hubId, new Set());
+  if (!dirtyKeys.has(hubId)) dirtyKeys.set(hubId, new Set());
   if (!bubbleCache.has(hubId)) bubbleCache.set(hubId, new Map());
   if (!branchCache.has(hubId)) branchCache.set(hubId, new Set());
   if (!chatCache.has(hubId)) chatCache.set(hubId, []);
@@ -239,6 +247,7 @@ async function resetHubRAM(hubId) {
   erasedKeys.get(hubId)?.clear();
   pixelBuffer.set(hubId, new Map());
   erasedKeys.set(hubId, new Set());
+  dirtyKeys.set(hubId, new Set());
   bubbleCache.set(hubId, new Map());
   branchCache.set(hubId, new Set());
   chatCache.set(hubId, []);
@@ -446,53 +455,82 @@ function getZoneAt(hubId, cx, cy) {
 }
 
 // ── DB flushing ───────────────────────────────────────────────────────────────
+// Skriver KUN de pixels der er ændret siden sidst (dirty) + sletninger.
 async function flushPixels(hubId) {
-  const buf = pixelBuffer.get(hubId);
-  const erased = erasedKeys.get(hubId);
+  if (flushing.has(hubId)) return;
+  flushing.add(hubId);
+  try {
+    const buf = pixelBuffer.get(hubId);
+    const erased = erasedKeys.get(hubId);
+    const dirty = dirtyKeys.get(hubId);
 
-  if (erased && erased.size > 0) {
-    for (const key of erased) {
-      const [x, y] = key.split(",").map(Number);
-      try {
-        await pool.execute(
-          "DELETE FROM nh_pixels WHERE hub_id=? AND x=? AND y=?",
-          [hubId, x, y],
-        );
-      } catch (_) {}
-    }
-    erased.clear();
-  }
-
-  if (buf && buf.size > 0) {
-    const rows = [...buf.values()];
-    for (let i = 0; i < rows.length; i += FLUSH_BATCH) {
-      const chunk = rows.slice(i, i + FLUSH_BATCH);
-      const ph = chunk.map(() => "(?,?,?,?,?,?,?,?)").join(",");
-      const vals = [];
-      chunk.forEach((p) =>
-        vals.push(
-          hubId,
-          p.x,
-          p.y,
-          p.color,
-          p.user_id,
-          p.username,
-          p.locked ? 1 : 0,
-          p.locked_by_zone ? 1 : 0,
-        ),
-      );
-      try {
-        await pool.execute(
-          `INSERT INTO nh_pixels (hub_id,x,y,color,user_id,username,locked,locked_by_zone) VALUES ${ph}
-           ON DUPLICATE KEY UPDATE color=VALUES(color),user_id=VALUES(user_id),username=VALUES(username),
-           locked=VALUES(locked),locked_by_zone=VALUES(locked_by_zone)`,
-          vals,
-        );
-      } catch (err) {
-        console.error("[neurohub] pixel upsert error:", err.message);
+    if (erased && erased.size > 0) {
+      const keys = [...erased];
+      erased.clear();
+      for (let i = 0; i < keys.length; i += FLUSH_BATCH) {
+        const chunk = keys.slice(i, i + FLUSH_BATCH);
+        const ph = chunk.map(() => "(?,?)").join(",");
+        const vals = [hubId];
+        chunk.forEach((k) => {
+          const [x, y] = k.split(",").map(Number);
+          vals.push(x, y);
+        });
+        try {
+          await pool.query(
+            `DELETE FROM nh_pixels WHERE hub_id=? AND (x,y) IN (${ph})`,
+            vals,
+          );
+        } catch (err) {
+          console.error("[neurohub] pixel delete error:", err.message);
+          chunk.forEach((k) => erased.add(k)); // prøv igen næste gang
+        }
       }
     }
+
+    if (buf && dirty && dirty.size > 0) {
+      const keys = [...dirty];
+      dirty.clear();
+      const rows = keys.map((k) => buf.get(k)).filter(Boolean);
+      for (let i = 0; i < rows.length; i += FLUSH_BATCH) {
+        const chunk = rows.slice(i, i + FLUSH_BATCH);
+        const ph = chunk.map(() => "(?,?,?,?,?,?,?,?)").join(",");
+        const vals = [];
+        chunk.forEach((p) =>
+          vals.push(
+            hubId,
+            p.x,
+            p.y,
+            p.color,
+            p.user_id,
+            p.username,
+            p.locked ? 1 : 0,
+            p.locked_by_zone ? 1 : 0,
+          ),
+        );
+        try {
+          await pool.execute(
+            `INSERT INTO nh_pixels (hub_id,x,y,color,user_id,username,locked,locked_by_zone) VALUES ${ph}
+             ON DUPLICATE KEY UPDATE color=VALUES(color),user_id=VALUES(user_id),username=VALUES(username),
+             locked=VALUES(locked),locked_by_zone=VALUES(locked_by_zone)`,
+            vals,
+          );
+        } catch (err) {
+          console.error("[neurohub] pixel upsert error:", err.message);
+          chunk.forEach((p) => dirty.add(`${p.x},${p.y}`)); // prøv igen næste gang
+        }
+      }
+    }
+  } finally {
+    flushing.delete(hubId);
   }
+}
+
+function scheduleFlushIfBig(hubId) {
+  const dirty = dirtyKeys.get(hubId);
+  if (dirty && dirty.size >= FLUSH_BATCH && !flushing.has(hubId))
+    flushPixels(hubId).catch((e) =>
+      console.error("[neurohub] flush error:", e.message),
+    );
 }
 
 async function flushAllPixels() {
@@ -542,7 +580,7 @@ function startServer() {
       return res.end(
         JSON.stringify({
           ok: true,
-          version: "6.8",
+          version: "6.9",
           loadedHubs: [...loadedHubs],
           pixelCounts: Object.fromEntries(
             [...pixelBuffer.entries()].map(([k, v]) => [k, v.size]),
@@ -635,24 +673,25 @@ function startServer() {
     });
     io.to(hubId).emit("presence_list", presenceList(hubId));
 
-    socket.on("pixel", (data) => {
-      const x = parseInt(data.x),
-        y = parseInt(data.y);
-      if (isNaN(x) || isNaN(y) || x < 0 || y < 0) return;
+    // Fælles logik for ét pixel-forsøg. Returnerer intet; resultater samles i `out`.
+    function handlePixelOp(data, out) {
+      const x = parseInt(data?.x),
+        y = parseInt(data?.y);
+      if (isNaN(x) || isNaN(y) || x < 0 || y < 0 || x >= MAX_CX || y >= MAX_CY)
+        return;
       const erase = !!data.erase;
       const key = `${x},${y}`;
       const buf = pixelBuffer.get(hubId);
       const erased = erasedKeys.get(hubId);
+      const dirty = dirtyKeys.get(hubId);
       const existing = buf.get(key);
       const inLockedZone = isInLockedZone(hubId, x, y);
       const isLockedPixel = existing && existing.locked;
 
       if (!isAdmin && (inLockedZone || isLockedPixel)) {
         const zone = getZoneAt(hubId, x, y);
-        socket.emit("zone_flash", {
-          zone: zone || null,
-          pixels: zone ? null : [{ x, y }],
-        });
+        if (zone) out.zones.set(zone.id, zone);
+        else out.pixels.push({ x, y });
         return;
       }
 
@@ -666,9 +705,11 @@ function startServer() {
 
       if (erase) {
         buf.delete(key);
+        dirty.delete(key);
         erased.add(key);
       } else {
         erased.delete(key);
+        dirty.add(key);
         buf.set(key, {
           x,
           y,
@@ -679,15 +720,34 @@ function startServer() {
           locked_by_zone,
         });
       }
-
-      io.to(hubId).emit("pixel", {
+      out.accepted.push({
         x,
         y,
         color: erase ? null : color,
         erase,
         locked: locked ? 1 : 0,
       });
-      if (buf.size >= FLUSH_BATCH) flushPixels(hubId).catch(console.error);
+    }
+
+    function processPixelOps(list) {
+      const out = { accepted: [], zones: new Map(), pixels: [] };
+      for (const op of list) handlePixelOp(op, out);
+      if (out.accepted.length)
+        socket.to(hubId).emit("pixels", { list: out.accepted });
+      out.zones.forEach((zone) =>
+        socket.emit("zone_flash", { zone, pixels: null }),
+      );
+      if (out.pixels.length)
+        socket.emit("zone_flash", { zone: null, pixels: out.pixels });
+      scheduleFlushIfBig(hubId);
+    }
+
+    socket.on("pixel", (data) => processPixelOps([data]));
+    socket.on("pixels", (data) => {
+      const list = Array.isArray(data?.list)
+        ? data.list.slice(0, MAX_PIXEL_OPS_PER_BATCH)
+        : [];
+      if (list.length) processPixelOps(list);
     });
 
     socket.on("chat", async (data) => {
@@ -730,7 +790,7 @@ function startServer() {
         type === "brain" ? String(data.content || "").substring(0, 500) : null;
       const emotion =
         type === "emotion" ? String(data.emotion || "").substring(0, 64) : null;
-      // undefined (ikke sendt) → null (auto)
+
       const sizeW =
         parseDim(data.size_w ?? null, MIN_BUBBLE_W, MAX_BUBBLE_W) ?? null;
       const sizeH =
@@ -748,6 +808,14 @@ function startServer() {
       const rawIconId = parseInt(data.emotion_icon_id, 10);
       const emotionIconId =
         type === "emotion" && Number.isFinite(rawIconId) ? rawIconId : null;
+
+      // Kun forælder der faktisk findes i denne hub tæller
+      let parentId = null;
+      if (data.parent_id !== undefined && data.parent_id !== null) {
+        const pid = parseInt(data.parent_id, 10);
+        if (Number.isFinite(pid) && bubbleCache.get(hubId)?.has(pid))
+          parentId = pid;
+      }
 
       try {
         const [res] = await pool.execute(
@@ -769,18 +837,6 @@ function startServer() {
           ],
         );
         const bubbleId = res.insertId;
-        if (data.parent_id) {
-          const parentId = parseInt(data.parent_id);
-          await pool.execute(
-            "INSERT IGNORE INTO nh_branches (hub_id,parent_id,child_id) VALUES (?,?,?)",
-            [hubId, parentId, bubbleId],
-          );
-          branchCache.get(hubId).add(`${parentId}-${bubbleId}`);
-          io.to(hubId).emit("branch_add", {
-            parent_id: parentId,
-            child_id: bubbleId,
-          });
-        }
         const bubble = {
           id: bubbleId,
           type,
@@ -796,9 +852,33 @@ function startServer() {
           username,
           user_id: userId,
         };
+        // Cache først, så alt andet (andre brugere, branch_add) kan se boblen
         bubbleCache.get(hubId).set(bubbleId, bubble);
-        io.to(hubId).emit("bubble_update", bubble);
-        if (typeof ack === "function") ack({ ok: true, id: bubbleId });
+        if (parentId !== null)
+          branchCache.get(hubId).add(`${parentId}-${bubbleId}`);
+
+        // Svar opretteren STRAKS (klienten har allerede tegnet boblen)
+        if (typeof ack === "function") ack({ ok: true, id: bubbleId, bubble });
+
+        // De andre får boblen + forbindelsen
+        socket.to(hubId).emit("bubble_update", bubble);
+        if (parentId !== null)
+          socket.to(hubId).emit("branch_add", {
+            parent_id: parentId,
+            child_id: bubbleId,
+          });
+
+        // Forbindelsen persisteres bagefter (ikke på den kritiske vej)
+        if (parentId !== null) {
+          try {
+            await pool.execute(
+              "INSERT IGNORE INTO nh_branches (hub_id,parent_id,child_id) VALUES (?,?,?)",
+              [hubId, parentId, bubbleId],
+            );
+          } catch (e) {
+            console.error("[neurohub] bubble_save branch insert:", e.message);
+          }
+        }
       } catch (e) {
         console.error("[neurohub] bubble_save:", e.message);
         if (typeof ack === "function") ack({ ok: false });
@@ -815,6 +895,7 @@ function startServer() {
       b.x = x;
       b.y = y;
       socket.to(hubId).emit("bubble_moved", { id, x, y });
+      if (data.final === false) return; // live-bevægelse: ingen DB-skrivning
       try {
         await pool.execute(
           "UPDATE nh_bubbles SET x=?,y=? WHERE id=? AND hub_id=?",
@@ -898,7 +979,7 @@ function startServer() {
           console.error("[neurohub] bubble_edit:", e.message);
         }
       }
-      io.to(hubId).emit("bubble_update", b);
+      socket.to(hubId).emit("bubble_update", b);
     });
 
     socket.on("bubble_delete", async (data) => {
@@ -955,7 +1036,7 @@ function startServer() {
           [hubId, parentId, childId],
         );
         bc.add(key1);
-        io.to(hubId).emit("branch_add", {
+        socket.to(hubId).emit("branch_add", {
           parent_id: parentId,
           child_id: childId,
         });
@@ -985,7 +1066,7 @@ function startServer() {
         bc.delete(key2);
       }
 
-      io.to(hubId).emit("branch_delete", {
+      socket.to(hubId).emit("branch_delete", {
         parent_id: parentId,
         child_id: childId,
       });
@@ -1104,7 +1185,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.8 listening on :${PORT}`);
+    console.log(`[neurohub] v6.9 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
