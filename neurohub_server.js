@@ -1,38 +1,28 @@
 /**
- * neurohub_server.js — v6.6
+ * neurohub_server.js — v6.7
  *
- * CHANGES vs v6.5:
- * - FIXED FATAL BUG: warmUp() had two `const [bubbles] = ...` declarations
- *   in the same function scope. This is a JavaScript SyntaxError
- *   ("Identifier 'bubbles' has already been declared") — Node.js cannot
- *   even parse the file, so the process crashes on every start/restart.
- *   This is why the frontend saw "nothing loads from server" — the server
- *   was never actually running. Merged into a single query that includes
- *   emotion_icon_id.
- * - FIXED: bootstrap() had the schema-extension migration loop duplicated,
- *   with the second copy running AFTER startServer() had already been
- *   called (and after warmUp() had already read from nh_bubbles). Merged
- *   into a single migration block that runs once, fully, before warmUp().
- * - emotion_icon_id is now added to nh_bubbles via migration, selected in
- *   warmUp()/_doInitHub(), and read/written by bubble_save/bubble_edit, so
- *   emotion icons persist correctly across reloads and for other users.
- * - bubble_save/bubble_edit now allow emotion_val = 0 (previously
- *   `parseInt(...) || 5` treated 0 as falsy and silently replaced it with 5).
+ * CHANGES vs v6.6:
+ * - NY: nh_bubbles.size_scale (FLOAT, default 1) — bobler kan nu have en
+ *   individuel størrelse (0.5–3.0). Tilføjes via migration, gemmes i
+ *   bubble_save, kan ændres via bubble_edit og sendes med i state/bubble_update.
+ * - NY: bubble_edit understøtter nu `color` (#rrggbb) og `size_scale` for
+ *   BÅDE thought- og emotion-bobler. UPDATE bygges dynamisk, så kun de felter
+ *   der faktisk blev sendt, bliver skrevet.
+ * - NY: "branch_delete" socket-handler — sletter en enkelt forbindelse mellem
+ *   to bobler (begge retninger), opdaterer RAM-cache + DB og broadcaster
+ *   "branch_delete" til hub-rummet.
+ * - DB-adgangskoden står IKKE længere hardcoded i filen. Sæt DB_PASS (og
+ *   evt. DB_HOST/DB_USER/DB_NAME/USERS_DB_NAME) i din .env.
+ * - warmUp() henter bobler med SELECT * så serveren ikke crasher hvis
+ *   migrationen af en ny kolonne endnu ikke er kørt.
+ * - bubble_move / bubble_delete / bubble_edit begrænser nu også på hub_id i SQL.
  *
- * CHANGES vs v6.4:
- * - Added a "branch_add" socket handler for connecting two bubbles that
- *   ALREADY exist (used by the frontend's press-and-drag "+" connect,
- *   e.g. dragging an existing thought bubble onto an existing emotion
- *   bubble). Validates both bubble ids belong to the hub, rejects
- *   self-loops, treats an already-existing edge (either direction) as a
- *   harmless no-op success, persists to nh_branches, updates the in-RAM
- *   branchCache, and broadcasts "branch_add" to the hub room — mirroring
- *   the branch_add emit that bubble_save already does when a brand-new
- *   bubble is created with a parent_id.
+ * Hvis din MySQL-version ikke understøtter "ADD COLUMN IF NOT EXISTS", så kør
+ * manuelt:
+ *   ALTER TABLE nh_bubbles ADD COLUMN size_scale FLOAT NOT NULL DEFAULT 1;
  *
- * CHANGES vs v6.3:
- * - Automatically copies defaults from `nh_hub_defaults` if a hub is loaded
- * for the first time and is completely empty.
+ * (Ældre changelog: se v6.6 — duplikeret const [bubbles] fix, emotion_icon_id,
+ *  branch_add, default-kopiering fra nh_hub_defaults.)
  */
 "use strict";
 
@@ -54,7 +44,7 @@ const NEUROHUB_DB = {
   host: process.env.DB_HOST || "mysql48.unoeuro.com",
   port: parseInt(process.env.DB_PORT || "3306"),
   user: process.env.DB_USER || "jakobkall_com",
-  password: process.env.DB_PASS || "cfDEmaw5n96t",
+  password: process.env.DB_PASS,
   database: process.env.DB_NAME || "jakobkall_com_db_neurohub",
   waitForConnections: true,
   connectionLimit: 10,
@@ -65,7 +55,7 @@ const USERS_DB = {
   host: process.env.DB_HOST || "mysql48.unoeuro.com",
   port: parseInt(process.env.DB_PORT || "3306"),
   user: process.env.DB_USER || "jakobkall_com",
-  password: process.env.DB_PASS || "cfDEmaw5n96t",
+  password: process.env.DB_PASS,
   database: process.env.USERS_DB_NAME || "jakobkall_com_db",
   waitForConnections: true,
   connectionLimit: 5,
@@ -90,6 +80,16 @@ const FLUSH_BATCH = 200;
 const WORLD_W = 4000,
   WORLD_H = 2800;
 
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 3.0;
+const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+
+function clampScale(v, fallback = 1) {
+  const n = parseFloat(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.round(Math.min(MAX_SCALE, Math.max(MIN_SCALE, n)) * 100) / 100;
+}
+
 let pool;
 let usersPool;
 let io;
@@ -112,6 +112,7 @@ async function bootstrap() {
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
     "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked_by_zone TINYINT(1) NOT NULL DEFAULT 0",
     "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS emotion_icon_id INT NULL DEFAULT NULL",
+    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS size_scale FLOAT NOT NULL DEFAULT 1",
   ]) {
     try {
       await pool.execute(sql);
@@ -153,13 +154,12 @@ async function warmUp() {
     });
   });
 
-  const [bubbles] = await pool.query(
-    "SELECT id,hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,user_id,username FROM nh_bubbles",
-  );
+  // SELECT * så size_scale / emotion_icon_id automatisk følger med
+  const [bubbles] = await pool.query("SELECT * FROM nh_bubbles");
   bubbles.forEach((b) => {
     loadedHubs.add(b.hub_id);
     ensureHubBuffers(b.hub_id);
-    bubbleCache.get(b.hub_id).set(b.id, { ...b });
+    bubbleCache.get(b.hub_id).set(b.id, normalizeBubbleRow(b));
   });
 
   const [branches] = await pool.query(
@@ -201,6 +201,11 @@ async function warmUp() {
   loadedHubs.add("public");
   ensureHubBuffers("public");
   console.log("[neurohub] Warm-up complete");
+}
+
+// Sørger for at size_scale altid er et tal (default 1), uanset DB-version
+function normalizeBubbleRow(b) {
+  return { ...b, size_scale: clampScale(b.size_scale, 1) };
 }
 
 function ensureHubBuffers(hubId) {
@@ -262,7 +267,7 @@ async function _doInitHub(hubId) {
       return false;
     }
 
-    // ── KOPERING AF DEFAULT ELEMENTER HVIS HUBBEN ER HELT TOM ──
+    // ── KOPIERING AF DEFAULT ELEMENTER HVIS HUBBEN ER HELT TOM ──
     const [pCheck] = await pool.query(
       "SELECT 1 FROM nh_pixels WHERE hub_id = ? LIMIT 1",
       [hubId],
@@ -336,12 +341,14 @@ async function _doInitHub(hubId) {
       });
     });
 
-    // Load bubbles (SELECT * automatically picks up emotion_icon_id)
+    // Load bubbles (SELECT * picks up emotion_icon_id + size_scale)
     const [bubbles] = await pool.query(
       "SELECT * FROM nh_bubbles WHERE hub_id = ?",
       [hubId],
     );
-    bubbles.forEach((b) => bubbleCache.get(hubId).set(b.id, { ...b }));
+    bubbles.forEach((b) =>
+      bubbleCache.get(hubId).set(b.id, normalizeBubbleRow(b)),
+    );
 
     // Load branches
     const [branches] = await pool.query(
@@ -635,7 +642,7 @@ function startServer() {
 
       const color = erase
         ? null
-        : String(data.color || "").match(/^#[0-9a-fA-F]{6}$/)
+        : String(data.color || "").match(HEX_RE)
           ? data.color
           : "#ffffff";
       const locked = isAdmin && !erase && (!!data.locked || inLockedZone);
@@ -700,13 +707,14 @@ function startServer() {
       const type = data.type === "emotion" ? "emotion" : "brain";
       const x = Math.max(0, parseInt(data.x) || 100);
       const y = Math.max(0, parseInt(data.y) || 100);
-      const color = String(data.color || "#6ee7f7").match(/^#[0-9a-fA-F]{6}$/)
+      const color = String(data.color || "#6ee7f7").match(HEX_RE)
         ? data.color
         : "#6ee7f7";
       const content =
         type === "brain" ? String(data.content || "").substring(0, 500) : null;
       const emotion =
         type === "emotion" ? String(data.emotion || "").substring(0, 64) : null;
+      const sizeScale = clampScale(data.size_scale, 1);
 
       // 0 skal kunne gemmes — Number.isFinite i stedet for `|| 5`
       const rawVal = parseInt(data.emotion_val, 10);
@@ -723,7 +731,7 @@ function startServer() {
 
       try {
         const [res] = await pool.execute(
-          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,size_scale,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
           [
             hubId,
             type,
@@ -734,6 +742,7 @@ function startServer() {
             emotion,
             emotionVal,
             emotionIconId,
+            sizeScale,
             userId,
             username,
           ],
@@ -761,6 +770,7 @@ function startServer() {
           emotion,
           emotion_val: emotionVal,
           emotion_icon_id: emotionIconId,
+          size_scale: sizeScale,
           username,
           user_id: userId,
         };
@@ -779,54 +789,81 @@ function startServer() {
         y = parseInt(data.y);
       if (isNaN(id) || isNaN(x) || isNaN(y)) return;
       const b = bubbleCache.get(hubId)?.get(id);
-      if (b) {
-        b.x = x;
-        b.y = y;
-      }
+      if (!b) return;
+      b.x = x;
+      b.y = y;
       socket.to(hubId).emit("bubble_moved", { id, x, y });
       try {
-        await pool.execute("UPDATE nh_bubbles SET x=?,y=? WHERE id=?", [
-          x,
-          y,
-          id,
-        ]);
+        await pool.execute(
+          "UPDATE nh_bubbles SET x=?,y=? WHERE id=? AND hub_id=?",
+          [x, y, id, hubId],
+        );
       } catch (_) {}
     });
 
+    // bubble_edit — opdaterer kun de felter der faktisk er sendt:
+    //   color, size_scale  (alle bobler)
+    //   emotion, emotion_val, emotion_icon_id  (emotion-bobler)
+    //   content  (thought-bobler)
     socket.on("bubble_edit", async (data) => {
       const id = parseInt(data.id);
+      if (isNaN(id)) return;
       const b = bubbleCache.get(hubId)?.get(id);
       if (!b) return;
-      if (b.type === "emotion") {
-        if (data.emotion !== undefined)
-          b.emotion = String(data.emotion).substring(0, 64);
 
+      const sets = [];
+      const vals = [];
+
+      if (data.color !== undefined && HEX_RE.test(String(data.color))) {
+        b.color = String(data.color);
+        sets.push("color=?");
+        vals.push(b.color);
+      }
+
+      if (data.size_scale !== undefined) {
+        b.size_scale = clampScale(data.size_scale, b.size_scale ?? 1);
+        sets.push("size_scale=?");
+        vals.push(b.size_scale);
+      }
+
+      if (b.type === "emotion") {
+        if (data.emotion !== undefined) {
+          b.emotion = String(data.emotion).substring(0, 64);
+          sets.push("emotion=?");
+          vals.push(b.emotion);
+        }
         // 0 skal kunne gemmes — samme fix som i bubble_save
         if (data.emotion_val !== undefined) {
           const parsed = parseInt(data.emotion_val, 10);
           b.emotion_val = Number.isFinite(parsed)
             ? Math.min(10, Math.max(0, parsed))
             : 5;
+          sets.push("emotion_val=?");
+          vals.push(b.emotion_val);
         }
         if (data.emotion_icon_id !== undefined) {
           const parsedIcon = parseInt(data.emotion_icon_id, 10);
           b.emotion_icon_id = Number.isFinite(parsedIcon) ? parsedIcon : null;
+          sets.push("emotion_icon_id=?");
+          vals.push(b.emotion_icon_id);
         }
+      } else {
+        if (data.content !== undefined) {
+          b.content = String(data.content).substring(0, 500);
+          sets.push("content=?");
+          vals.push(b.content);
+        }
+      }
+
+      if (sets.length) {
         try {
           await pool.execute(
-            "UPDATE nh_bubbles SET emotion=?,emotion_val=?,emotion_icon_id=? WHERE id=?",
-            [b.emotion, b.emotion_val, b.emotion_icon_id ?? null, id],
+            `UPDATE nh_bubbles SET ${sets.join(",")} WHERE id=? AND hub_id=?`,
+            [...vals, id, hubId],
           );
-        } catch (_) {}
-      } else {
-        if (data.content !== undefined)
-          b.content = String(data.content).substring(0, 500);
-        try {
-          await pool.execute("UPDATE nh_bubbles SET content=? WHERE id=?", [
-            b.content,
-            id,
-          ]);
-        } catch (_) {}
+        } catch (e) {
+          console.error("[neurohub] bubble_edit:", e.message);
+        }
       }
       io.to(hubId).emit("bubble_update", b);
     });
@@ -843,21 +880,18 @@ function startServer() {
         }
       io.to(hubId).emit("bubble_delete", { id });
       try {
-        await pool.execute("DELETE FROM nh_bubbles WHERE id=?", [id]);
+        await pool.execute("DELETE FROM nh_bubbles WHERE id=? AND hub_id=?", [
+          id,
+          hubId,
+        ]);
         await pool.execute(
-          "DELETE FROM nh_branches WHERE parent_id=? OR child_id=?",
-          [id, id],
+          "DELETE FROM nh_branches WHERE hub_id=? AND (parent_id=? OR child_id=?)",
+          [hubId, id, id],
         );
       } catch (_) {}
     });
 
-    // Connects two bubbles that ALREADY exist (e.g. dragging the "+" handle
-    // on an existing thought bubble and dropping it onto an existing
-    // emotion bubble) — as opposed to bubble_save's parent_id, which wires
-    // up a brand-new bubble to a parent at creation time. Emitted by the
-    // frontend's connectExistingBubbles(). No admin check, same as
-    // bubble_save/bubble_edit/bubble_delete — any connected user can link
-    // two bubbles they can already see.
+    // Forbinder to bobler der ALLEREDE findes.
     socket.on("branch_add", async (data, ack) => {
       const parentId = parseInt(data.parent_id);
       const childId = parseInt(data.child_id);
@@ -878,8 +912,6 @@ function startServer() {
       const key1 = `${parentId}-${childId}`;
       const key2 = `${childId}-${parentId}`;
       if (bc && (bc.has(key1) || bc.has(key2))) {
-        // Already connected (either direction) — treat as a harmless no-op
-        // success rather than an error.
         if (typeof ack === "function") ack({ ok: true, already: true });
         return;
       }
@@ -897,6 +929,42 @@ function startServer() {
         if (typeof ack === "function") ack({ ok: true });
       } catch (e) {
         console.error("[neurohub] branch_add:", e.message);
+        if (typeof ack === "function") ack({ ok: false });
+      }
+    });
+
+    // Sletter ÉN specifik forbindelse mellem to bobler (uanset retning).
+    // Boblerne selv røres ikke.
+    socket.on("branch_delete", async (data, ack) => {
+      const parentId = parseInt(data?.parent_id);
+      const childId = parseInt(data?.child_id);
+      if (isNaN(parentId) || isNaN(childId)) {
+        if (typeof ack === "function")
+          ack({ ok: false, reason: "invalid_ids" });
+        return;
+      }
+
+      const bc = branchCache.get(hubId);
+      const key1 = `${parentId}-${childId}`;
+      const key2 = `${childId}-${parentId}`;
+      if (bc) {
+        bc.delete(key1);
+        bc.delete(key2);
+      }
+
+      io.to(hubId).emit("branch_delete", {
+        parent_id: parentId,
+        child_id: childId,
+      });
+
+      try {
+        await pool.execute(
+          "DELETE FROM nh_branches WHERE hub_id=? AND ((parent_id=? AND child_id=?) OR (parent_id=? AND child_id=?))",
+          [hubId, parentId, childId, childId, parentId],
+        );
+        if (typeof ack === "function") ack({ ok: true });
+      } catch (e) {
+        console.error("[neurohub] branch_delete:", e.message);
         if (typeof ack === "function") ack({ ok: false });
       }
     });
@@ -1003,7 +1071,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.6 listening on :${PORT}`);
+    console.log(`[neurohub] v6.7 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
