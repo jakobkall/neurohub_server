@@ -1,6 +1,18 @@
 /**
  * neurohub_server.js — v6.9  (performance + datastruktur)
  *
+ * v6.9.1 — FIX: "ny boble vises kort og forsvinder igen".
+ *   Årsag: migrationerne brugte `ADD COLUMN IF NOT EXISTS`, som MySQL 8 slet
+ *   ikke understøtter (kun MariaDB). Fejlen blev slugt lydløst, så kolonnerne
+ *   size_w / size_h blev aldrig oprettet, og INSERT INTO nh_bubbles fejlede.
+ *   Klienten (v9.11) fjerner en boble der ikke kunne gemmes — derfor så den
+ *   ud til at forsvinde. Nu:
+ *   · kolonner tjekkes i information_schema og oprettes med almindelig ALTER
+ *     (virker på både MySQL 8 og MariaDB)
+ *   · INSERT/UPDATE bygges ud fra hvilke kolonner der FAKTISK findes, så
+ *     oprettelse af bobler virker selv hvis en ALTER ikke må køres
+ *   · den rigtige DB-fejl logges og sendes til klienten (vises i en toast)
+ *
  * CHANGES vs v6.8:
  * - ROD-ÅRSAG TIL LAG RETTET: pixel-handleren kaldte flushPixels() for HELE
  *   hubben (alle pixels, upsert af hver eneste række) for hver eneste pixel,
@@ -118,6 +130,49 @@ let pool;
 let usersPool;
 let io;
 
+// ── Schema-hjælpere (MySQL 8 + MariaDB kompatible) ─────────────────────────────
+const schema = { emotion_icon_id: false, size_w: false, size_h: false };
+
+async function columnExists(table, column) {
+  const [rows] = await pool.query(
+    "SELECT COUNT(*) AS c FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+    [table, column],
+  );
+  return Number(rows[0].c) > 0;
+}
+
+// Returnerer true hvis kolonnen findes (eller blev oprettet)
+async function ensureColumn(table, column, ddl) {
+  try {
+    if (await columnExists(table, column)) return true;
+    await pool.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    console.log(`[neurohub] added column ${table}.${column}`);
+    return true;
+  } catch (e) {
+    console.error(
+      `[neurohub] ❌ Kunne ikke oprette ${table}.${column}: ${e.message}\n` +
+        `            Kør manuelt: ALTER TABLE ${table} ADD COLUMN ${column} ${ddl};`,
+    );
+    return false;
+  }
+}
+
+async function ensureUniqueIndex(table, name, cols) {
+  try {
+    const [rows] = await pool.query(
+      "SELECT COUNT(*) AS c FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?",
+      [table, name],
+    );
+    if (Number(rows[0].c) > 0) return;
+    await pool.query(`ALTER TABLE ${table} ADD UNIQUE INDEX ${name} ${cols}`);
+    console.log(`[neurohub] added unique index ${table}.${name}`);
+  } catch (e) {
+    console.warn(
+      `[neurohub] unique index ${table}.${name} skipped: ${e.message}`,
+    );
+  }
+}
+
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function bootstrap() {
   pool = await mysql.createPool(NEUROHUB_DB);
@@ -131,31 +186,31 @@ async function bootstrap() {
     console.error("[neurohub] WARNING: Cannot read users table:", e.message);
   }
 
-  // Schema extensions — runs ONCE, fully, before warmUp() reads nh_bubbles.
-  for (const sql of [
-    "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE nh_pixels ADD COLUMN IF NOT EXISTS locked_by_zone TINYINT(1) NOT NULL DEFAULT 0",
-    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS emotion_icon_id INT NULL DEFAULT NULL",
-    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS size_w INT NULL DEFAULT NULL",
-    "ALTER TABLE nh_bubbles ADD COLUMN IF NOT EXISTS size_h INT NULL DEFAULT NULL",
-  ]) {
-    try {
-      await pool.execute(sql);
-    } catch (e) {
-      console.warn("[neurohub] migration skipped:", sql, "→", e.message);
-    }
-  }
-  try {
-    await pool.execute(
-      "ALTER TABLE nh_pixels ADD UNIQUE INDEX IF NOT EXISTS ux_hub_xy (hub_id,x,y)",
-    );
-  } catch (_) {
-    try {
-      await pool.execute(
-        "ALTER TABLE nh_pixels ADD UNIQUE INDEX ux_hub_xy (hub_id,x,y)",
-      );
-    } catch (_2) {}
-  }
+  // Schema extensions — kører FØR warmUp(). Bruger information_schema i stedet
+  // for "IF NOT EXISTS" (som MySQL 8 ikke kender for ADD COLUMN).
+  await ensureColumn("nh_pixels", "locked", "TINYINT(1) NOT NULL DEFAULT 0");
+  await ensureColumn(
+    "nh_pixels",
+    "locked_by_zone",
+    "TINYINT(1) NOT NULL DEFAULT 0",
+  );
+  schema.emotion_icon_id = await ensureColumn(
+    "nh_bubbles",
+    "emotion_icon_id",
+    "INT NULL DEFAULT NULL",
+  );
+  schema.size_w = await ensureColumn(
+    "nh_bubbles",
+    "size_w",
+    "INT NULL DEFAULT NULL",
+  );
+  schema.size_h = await ensureColumn(
+    "nh_bubbles",
+    "size_h",
+    "INT NULL DEFAULT NULL",
+  );
+  await ensureUniqueIndex("nh_pixels", "ux_hub_xy", "(hub_id,x,y)");
+  console.log("[neurohub] schema:", JSON.stringify(schema));
 
   await warmUp();
   setInterval(flushAllPixels, FLUSH_INTERVAL);
@@ -580,7 +635,8 @@ function startServer() {
       return res.end(
         JSON.stringify({
           ok: true,
-          version: "6.9",
+          version: "6.9.1",
+          schema,
           loadedHubs: [...loadedHubs],
           pixelCounts: Object.fromEntries(
             [...pixelBuffer.entries()].map(([k, v]) => [k, v.size]),
@@ -818,23 +874,35 @@ function startServer() {
       }
 
       try {
+        // Byg INSERT ud fra de kolonner der faktisk findes
+        const cols = [
+          "hub_id",
+          "type",
+          "x",
+          "y",
+          "color",
+          "content",
+          "emotion",
+          "emotion_val",
+        ];
+        const vals = [hubId, type, x, y, color, content, emotion, emotionVal];
+        if (schema.emotion_icon_id) {
+          cols.push("emotion_icon_id");
+          vals.push(emotionIconId);
+        }
+        if (schema.size_w) {
+          cols.push("size_w");
+          vals.push(sizeW);
+        }
+        if (schema.size_h) {
+          cols.push("size_h");
+          vals.push(sizeH);
+        }
+        cols.push("user_id", "username");
+        vals.push(userId, username);
         const [res] = await pool.execute(
-          "INSERT INTO nh_bubbles (hub_id,type,x,y,color,content,emotion,emotion_val,emotion_icon_id,size_w,size_h,user_id,username) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-          [
-            hubId,
-            type,
-            x,
-            y,
-            color,
-            content,
-            emotion,
-            emotionVal,
-            emotionIconId,
-            sizeW,
-            sizeH,
-            userId,
-            username,
-          ],
+          `INSERT INTO nh_bubbles (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`,
+          vals,
         );
         const bubbleId = res.insertId;
         const bubble = {
@@ -880,8 +948,13 @@ function startServer() {
           }
         }
       } catch (e) {
-        console.error("[neurohub] bubble_save:", e.message);
-        if (typeof ack === "function") ack({ ok: false });
+        console.error(
+          "[neurohub] bubble_save FAILED:",
+          e.code || "",
+          e.message,
+        );
+        if (typeof ack === "function")
+          ack({ ok: false, error: String(e.code || e.message || "db_error") });
       }
     });
 
@@ -927,16 +1000,20 @@ function startServer() {
         const w = parseDim(data.size_w, MIN_BUBBLE_W, MAX_BUBBLE_W);
         if (w !== undefined) {
           b.size_w = w;
-          sets.push("size_w=?");
-          vals.push(w);
+          if (schema.size_w) {
+            sets.push("size_w=?");
+            vals.push(w);
+          }
         }
       }
       if (data.size_h !== undefined) {
         const h = parseDim(data.size_h, MIN_BUBBLE_H, MAX_BUBBLE_H);
         if (h !== undefined) {
           b.size_h = h;
-          sets.push("size_h=?");
-          vals.push(h);
+          if (schema.size_h) {
+            sets.push("size_h=?");
+            vals.push(h);
+          }
         }
       }
 
@@ -958,8 +1035,10 @@ function startServer() {
         if (data.emotion_icon_id !== undefined) {
           const parsedIcon = parseInt(data.emotion_icon_id, 10);
           b.emotion_icon_id = Number.isFinite(parsedIcon) ? parsedIcon : null;
-          sets.push("emotion_icon_id=?");
-          vals.push(b.emotion_icon_id);
+          if (schema.emotion_icon_id) {
+            sets.push("emotion_icon_id=?");
+            vals.push(b.emotion_icon_id);
+          }
         }
       } else {
         if (data.content !== undefined) {
@@ -1185,7 +1264,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.9 listening on :${PORT}`);
+    console.log(`[neurohub] v6.9.1 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
