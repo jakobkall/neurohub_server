@@ -1,41 +1,27 @@
 /**
- * neurohub_server.js — v6.9  (performance + datastruktur)
+ * neurohub_server.js — v6.10  (kryptering af boble-tekst + størrelsesgrænser)
  *
- * v6.9.1 — FIX: "ny boble vises kort og forsvinder igen".
- *   Årsag: migrationerne brugte `ADD COLUMN IF NOT EXISTS`, som MySQL 8 slet
- *   ikke understøtter (kun MariaDB). Fejlen blev slugt lydløst, så kolonnerne
- *   size_w / size_h blev aldrig oprettet, og INSERT INTO nh_bubbles fejlede.
- *   Klienten (v9.11) fjerner en boble der ikke kunne gemmes — derfor så den
- *   ud til at forsvinde. Nu:
- *   · kolonner tjekkes i information_schema og oprettes med almindelig ALTER
- *     (virker på både MySQL 8 og MariaDB)
- *   · INSERT/UPDATE bygges ud fra hvilke kolonner der FAKTISK findes, så
- *     oprettelse af bobler virker selv hvis en ALTER ikke må køres
- *   · den rigtige DB-fejl logges og sendes til klienten (vises i en toast)
+ * v6.10:
+ *   · KRYPTERING: al tekst skrevet i bobler (thought: content, emotion: emotion)
+ *     krypteres med AES-256-GCM via ./neurohub_crypto.js (port af den centrale
+ *     public_html/includes/crypto.inc.php — samme "v2:"-format og nøgle).
+ *     - DB indeholder kun krypteret tekst ("v2:...").
+ *     - RAM-cache og socket-trafik er klartekst (brug https/wss i produktion).
+ *     - Ved opstart: kolonnerne udvides til TEXT, og eksisterende klartekst-
+ *       bobler krypteres automatisk (engangs-migration).
+ *     - Kontekst (AAD): "nh_bubbles.content" / "nh_bubbles.emotion"
+ *       → i PHP:  decryptData($v, 'nh_bubbles.content')
+ *   · BOBLE-STØRRELSER (skal matche klienten v9.13):
+ *       bredde: thought 140–600 px, emotion 210–600 px
+ *       højde : thought 56–500 px,  emotion 130–500 px
+ *     Højden er en MINIMUM-højde; boblen vokser selv hvis teksten kræver det,
+ *     så tekst aldrig skæres af og der aldrig kommer scrollbar.
  *
- * CHANGES vs v6.8:
- * - ROD-ÅRSAG TIL LAG RETTET: pixel-handleren kaldte flushPixels() for HELE
- *   hubben (alle pixels, upsert af hver eneste række) for hver eneste pixel,
- *   så snart hubben havde ≥200 pixels (`buf.size >= FLUSH_BATCH` talte alle
- *   pixels, ikke de ændrede). Det spærrede DB-poolen og event-loopet, så alt
- *   andet (fx nye bobler) kom til at vente. Nu holdes en "dirty"-mængde pr.
- *   hub, og kun ændrede pixels skrives (batchet). Sletninger sendes som ét
- *   batchet DELETE ... IN (...). Kun én flush ad gangen pr. hub.
- * - NY: "pixels"-event (batch). Klienten samler pixels og sender dem som én
- *   pakke; serveren validerer alle og broadcaster ÉN pakke til de andre.
- *   Afsenderen får ikke sine egne pixels retur (de er allerede tegnet).
- *   Det gamle enkelt-"pixel"-event virker stadig (bruger samme logik).
- * - bubble_save: svarer (ack) med den færdige boble med det samme efter
- *   INSERT, og broadcaster til de ANDRE. Forbindelsen til forælder gemmes
- *   i DB bagefter. Opretteren får altså ikke længere en dublet-boble retur.
- *   Ugyldigt parent_id ignoreres i stedet for at vælte hele kaldet.
- * - bubble_edit / branch_add / branch_delete broadcaster kun til de ANDRE
- *   (afsenderen har allerede ændret lokalt — et ekko kunne overskrive nyere
- *   værdier midt i et slider-træk).
- * - bubble_move accepterer { final:false } for live-bevægelse (broadcast
- *   uden DB-skrivning); DB opdateres kun ved final (default).
+ * v6.9.1 — FIX: "ny boble vises kort og forsvinder igen" (migrationer uden
+ *   ADD COLUMN IF NOT EXISTS; INSERT bygges ud fra eksisterende kolonner).
  *
- * (v6.8: size_w/size_h. v6.7: branch_delete, color. v6.6: m.fl.)
+ * v6.9 — performance: dirty-pixel flush, batch-"pixels", ack-first bubble_save,
+ *   broadcast kun til de andre, live bubble_move uden DB-skrivning.
  */
 "use strict";
 
@@ -43,6 +29,11 @@ const http = require("http");
 const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
 require("dotenv").config();
+const {
+  encryptData,
+  decryptData,
+  assertKeyConfigured,
+} = require("./neurohub_crypto");
 
 const PORT = process.env.PORT || 3001;
 const ALLOWED_ORIGINS = (
@@ -78,7 +69,7 @@ const USERS_DB = {
 // ── RAM caches ────────────────────────────────────────────────────────────────
 const pixelBuffer = new Map();
 const erasedKeys = new Map();
-const bubbleCache = new Map();
+const bubbleCache = new Map(); // klartekst i RAM
 const branchCache = new Map();
 const chatCache = new Map();
 const presence = new Map();
@@ -99,11 +90,35 @@ const MAX_CX = Math.floor(WORLD_W / PIXEL_CELL);
 const MAX_CY = Math.floor(WORLD_H / PIXEL_CELL);
 const MAX_PIXEL_OPS_PER_BATCH = 1000;
 
-const MIN_BUBBLE_W = 60;
-const MAX_BUBBLE_W = 1000;
-const MIN_BUBBLE_H = 40;
-const MAX_BUBBLE_H = 800;
+// ── Boble-grænser (SKAL matche klienten) ──────────────────────────────────────
+const MIN_BUBBLE_W_THOUGHT = 140;
+const MIN_BUBBLE_W_EMOTION = 210;
+const MAX_BUBBLE_W = 600;
+const MIN_BUBBLE_H_THOUGHT = 56;
+const MIN_BUBBLE_H_EMOTION = 130;
+const MAX_BUBBLE_H = 500;
+const MAX_THOUGHT_CHARS = 500;
+const MAX_EMOTION_CHARS = 64;
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+
+const minW = (type) =>
+  type === "emotion" ? MIN_BUBBLE_W_EMOTION : MIN_BUBBLE_W_THOUGHT;
+const minH = (type) =>
+  type === "emotion" ? MIN_BUBBLE_H_EMOTION : MIN_BUBBLE_H_THOUGHT;
+
+// ── Kryptering af boble-tekst ─────────────────────────────────────────────────
+const CTX_CONTENT = "nh_bubbles.content";
+const CTX_EMOTION = "nh_bubbles.emotion";
+
+// null → null (kolonnen er NULL for den anden boble-type), ellers krypteret
+function encField(v, ctx) {
+  if (v === null || v === undefined) return null;
+  return encryptData(String(v), ctx);
+}
+function decField(v, ctx) {
+  if (v === null || v === undefined) return v;
+  return decryptData(v, ctx);
+}
 
 // null  → nulstil til auto
 // tal   → clampet heltal
@@ -115,14 +130,23 @@ function parseDim(v, min, max) {
   return Math.min(max, Math.max(min, n));
 }
 
-// Ensartet form på bobler fra DB: size_w/size_h er tal eller null, og den
-// gamle size_scale-kolonne følger ikke med ud til klienterne.
+// Ensartet form på bobler fra DB: tekst dekrypteret, size_w/size_h er tal
+// (clampet til de gældende grænser) eller null, og den gamle size_scale-kolonne
+// følger ikke med ud til klienterne.
 function normalizeBubbleRow(b) {
   const { size_scale, ...rest } = b;
+  const w = rest.size_w == null ? null : Number(rest.size_w);
+  const h = rest.size_h == null ? null : Number(rest.size_h);
   return {
     ...rest,
-    size_w: rest.size_w == null ? null : Number(rest.size_w),
-    size_h: rest.size_h == null ? null : Number(rest.size_h),
+    content: decField(rest.content, CTX_CONTENT),
+    emotion: decField(rest.emotion, CTX_EMOTION),
+    size_w: Number.isFinite(w)
+      ? Math.min(MAX_BUBBLE_W, Math.max(minW(rest.type), Math.round(w)))
+      : null,
+    size_h: Number.isFinite(h)
+      ? Math.min(MAX_BUBBLE_H, Math.max(minH(rest.type), Math.round(h)))
+      : null,
   };
 }
 
@@ -157,6 +181,29 @@ async function ensureColumn(table, column, ddl) {
   }
 }
 
+// Sikrer at en kolonne er en TEXT-type (krypteret tekst er længere end klartekst).
+// Returnerer true hvis kolonnen kan rumme krypteret tekst.
+async function ensureTextColumn(table, column) {
+  try {
+    const [rows] = await pool.query(
+      "SELECT DATA_TYPE AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+      [table, column],
+    );
+    if (!rows.length) return false;
+    const t = String(rows[0].t).toLowerCase();
+    if (["text", "mediumtext", "longtext"].includes(t)) return true;
+    await pool.query(`ALTER TABLE ${table} MODIFY COLUMN ${column} TEXT NULL`);
+    console.log(`[neurohub] widened ${table}.${column} (${t} → TEXT)`);
+    return true;
+  } catch (e) {
+    console.error(
+      `[neurohub] ❌ Kunne ikke udvide ${table}.${column} til TEXT: ${e.message}\n` +
+        `            Kør manuelt: ALTER TABLE ${table} MODIFY COLUMN ${column} TEXT NULL;`,
+    );
+    return false;
+  }
+}
+
 async function ensureUniqueIndex(table, name, cols) {
   try {
     const [rows] = await pool.query(
@@ -173,8 +220,46 @@ async function ensureUniqueIndex(table, name, cols) {
   }
 }
 
+// Engangs-migration: krypterer eksisterende klartekst-bobler.
+// Rækker der allerede starter med "v2:" røres ikke → sikker at køre ved hver start.
+async function migrateEncryptBubbles() {
+  const [rows] = await pool.query(
+    `SELECT id, content, emotion FROM nh_bubbles
+      WHERE (content IS NOT NULL AND content <> '' AND content NOT LIKE 'v2:%')
+         OR (emotion IS NOT NULL AND emotion <> '' AND emotion NOT LIKE 'v2:%')`,
+  );
+  if (!rows.length) return;
+  console.log(`[neurohub] krypterer ${rows.length} eksisterende boble(r)…`);
+  let done = 0;
+  for (const r of rows) {
+    const sets = [];
+    const vals = [];
+    if (r.content && !String(r.content).startsWith("v2:")) {
+      sets.push("content=?");
+      vals.push(encryptData(r.content, CTX_CONTENT));
+    }
+    if (r.emotion && !String(r.emotion).startsWith("v2:")) {
+      sets.push("emotion=?");
+      vals.push(encryptData(r.emotion, CTX_EMOTION));
+    }
+    if (!sets.length) continue;
+    try {
+      await pool.execute(`UPDATE nh_bubbles SET ${sets.join(",")} WHERE id=?`, [
+        ...vals,
+        r.id,
+      ]);
+      done++;
+    } catch (e) {
+      console.error(`[neurohub] migrate bubble ${r.id}:`, e.message);
+    }
+  }
+  console.log(`[neurohub] ${done}/${rows.length} boble(r) krypteret`);
+}
+
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function bootstrap() {
+  assertKeyConfigured(); // nægter at starte uden ENCRYPTION_KEY
+
   pool = await mysql.createPool(NEUROHUB_DB);
   usersPool = await mysql.createPool(USERS_DB);
   console.log("[neurohub] Both DB pools connected");
@@ -210,6 +295,18 @@ async function bootstrap() {
     "INT NULL DEFAULT NULL",
   );
   await ensureUniqueIndex("nh_pixels", "ux_hub_xy", "(hub_id,x,y)");
+
+  // Krypteret tekst er længere end klartekst → kolonnerne SKAL være TEXT.
+  // Kan det ikke lade sig gøre, stopper vi hellere end at gemme noget forkert.
+  const okContent = await ensureTextColumn("nh_bubbles", "content");
+  const okEmotion = await ensureTextColumn("nh_bubbles", "emotion");
+  if (!okContent || !okEmotion) {
+    throw new Error(
+      "nh_bubbles.content / nh_bubbles.emotion er ikke TEXT-kolonner — kan ikke gemme krypteret tekst.",
+    );
+  }
+  await migrateEncryptBubbles();
+
   console.log("[neurohub] schema:", JSON.stringify(schema));
 
   await warmUp();
@@ -241,7 +338,7 @@ async function warmUp() {
   bubbles.forEach((b) => {
     loadedHubs.add(b.hub_id);
     ensureHubBuffers(b.hub_id);
-    bubbleCache.get(b.hub_id).set(b.id, normalizeBubbleRow(b));
+    bubbleCache.get(b.hub_id).set(b.id, normalizeBubbleRow(b)); // dekrypterer
   });
 
   const [branches] = await pool.query(
@@ -420,7 +517,8 @@ async function _doInitHub(hubId) {
       });
     });
 
-    // Load bubbles (SELECT * picks up emotion_icon_id + size_w + size_h)
+    // Load bubbles (SELECT * picks up emotion_icon_id + size_w + size_h;
+    // normalizeBubbleRow dekrypterer teksten)
     const [bubbles] = await pool.query(
       "SELECT * FROM nh_bubbles WHERE hub_id = ?",
       [hubId],
@@ -635,7 +733,8 @@ function startServer() {
       return res.end(
         JSON.stringify({
           ok: true,
-          version: "6.9.1",
+          version: "6.10.0",
+          encryption: "aes-256-gcm (v2)",
           schema,
           loadedHubs: [...loadedHubs],
           pixelCounts: Object.fromEntries(
@@ -842,15 +941,20 @@ function startServer() {
       const color = String(data.color || "#6ee7f7").match(HEX_RE)
         ? data.color
         : "#6ee7f7";
+      // Klartekst (til cache/klienter) — krypteres først lige før DB-skrivning
       const content =
-        type === "brain" ? String(data.content || "").substring(0, 500) : null;
+        type === "brain"
+          ? String(data.content || "").substring(0, MAX_THOUGHT_CHARS)
+          : null;
       const emotion =
-        type === "emotion" ? String(data.emotion || "").substring(0, 64) : null;
+        type === "emotion"
+          ? String(data.emotion || "").substring(0, MAX_EMOTION_CHARS)
+          : null;
 
       const sizeW =
-        parseDim(data.size_w ?? null, MIN_BUBBLE_W, MAX_BUBBLE_W) ?? null;
+        parseDim(data.size_w ?? null, minW(type), MAX_BUBBLE_W) ?? null;
       const sizeH =
-        parseDim(data.size_h ?? null, MIN_BUBBLE_H, MAX_BUBBLE_H) ?? null;
+        parseDim(data.size_h ?? null, minH(type), MAX_BUBBLE_H) ?? null;
 
       // 0 skal kunne gemmes — Number.isFinite i stedet for `|| 5`
       const rawVal = parseInt(data.emotion_val, 10);
@@ -885,7 +989,16 @@ function startServer() {
           "emotion",
           "emotion_val",
         ];
-        const vals = [hubId, type, x, y, color, content, emotion, emotionVal];
+        const vals = [
+          hubId,
+          type,
+          x,
+          y,
+          color,
+          encField(content, CTX_CONTENT), // 🔒 krypteret i DB
+          encField(emotion, CTX_EMOTION), // 🔒 krypteret i DB
+          emotionVal,
+        ];
         if (schema.emotion_icon_id) {
           cols.push("emotion_icon_id");
           vals.push(emotionIconId);
@@ -981,6 +1094,7 @@ function startServer() {
     //   color, size_w, size_h  (alle bobler; size_* = null nulstiller til auto)
     //   emotion, emotion_val, emotion_icon_id  (emotion-bobler)
     //   content  (thought-bobler)
+    // Tekstfelter (content / emotion) krypteres før de skrives til DB.
     socket.on("bubble_edit", async (data) => {
       const id = parseInt(data.id);
       if (isNaN(id)) return;
@@ -997,7 +1111,7 @@ function startServer() {
       }
 
       if (data.size_w !== undefined) {
-        const w = parseDim(data.size_w, MIN_BUBBLE_W, MAX_BUBBLE_W);
+        const w = parseDim(data.size_w, minW(b.type), MAX_BUBBLE_W);
         if (w !== undefined) {
           b.size_w = w;
           if (schema.size_w) {
@@ -1007,7 +1121,7 @@ function startServer() {
         }
       }
       if (data.size_h !== undefined) {
-        const h = parseDim(data.size_h, MIN_BUBBLE_H, MAX_BUBBLE_H);
+        const h = parseDim(data.size_h, minH(b.type), MAX_BUBBLE_H);
         if (h !== undefined) {
           b.size_h = h;
           if (schema.size_h) {
@@ -1019,9 +1133,9 @@ function startServer() {
 
       if (b.type === "emotion") {
         if (data.emotion !== undefined) {
-          b.emotion = String(data.emotion).substring(0, 64);
+          b.emotion = String(data.emotion).substring(0, MAX_EMOTION_CHARS);
           sets.push("emotion=?");
-          vals.push(b.emotion);
+          vals.push(encField(b.emotion, CTX_EMOTION)); // 🔒
         }
         // 0 skal kunne gemmes — samme fix som i bubble_save
         if (data.emotion_val !== undefined) {
@@ -1042,9 +1156,9 @@ function startServer() {
         }
       } else {
         if (data.content !== undefined) {
-          b.content = String(data.content).substring(0, 500);
+          b.content = String(data.content).substring(0, MAX_THOUGHT_CHARS);
           sets.push("content=?");
-          vals.push(b.content);
+          vals.push(encField(b.content, CTX_CONTENT)); // 🔒
         }
       }
 
@@ -1264,7 +1378,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.9.1 listening on :${PORT}`);
+    console.log(`[neurohub] v6.10.0 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
