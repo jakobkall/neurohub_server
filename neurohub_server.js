@@ -1,5 +1,11 @@
 /**
- * neurohub_server.js — v6.10  (kryptering af boble-tekst + størrelsesgrænser)
+ * neurohub_server.js — v6.11  (adgangskontrol + kryptering af boble-tekst)
+ *
+ * v6.11: SERVEREN TJEKKER NU access_code for private hubs ved socket-forbindelse
+ *   (før hubben indlæses). Koden i DB må være klartekst eller krypteret
+ *   (kontekst "nh_hubs.access_code"). Rate limit: 5 forkerte koder pr. IP+hub
+ *   og 60 pr. hub pr. 10 min. /hubs viser ikke længere private hubs.
+ *   HUB_ACCESS_MODE=log giver en "tør-kørsel" uden at nægte nogen.
  *
  * v6.10:
  *   · KRYPTERING: al tekst skrevet i bobler (thought: content, emotion: emotion)
@@ -26,6 +32,7 @@
 "use strict";
 
 const http = require("http");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
 require("dotenv").config();
@@ -258,7 +265,15 @@ async function migrateEncryptBubbles() {
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function bootstrap() {
-  assertKeyConfigured(); // nægter at starte uden ENCRYPTION_KEY
+  // Nægter at starte uden ENCRYPTION_KEY — og kører en krypterings-selvtest
+  const keyInfo = assertKeyConfigured();
+  console.log(
+    `[neurohub] ENCRYPTION_KEY OK (kilde: ${keyInfo.source}, ${keyInfo.length} tegn) — selvtest bestået`,
+  );
+  if (keyInfo.insecure)
+    console.warn(
+      "[neurohub] ⚠️ ENCRYPTION_KEY er PHP-filens offentlige standardnøgle — brug en rigtig, hemmelig nøgle!",
+    );
 
   pool = await mysql.createPool(NEUROHUB_DB);
   usersPool = await mysql.createPool(USERS_DB);
@@ -561,6 +576,109 @@ async function _doInitHub(hubId) {
   }
 }
 
+// ── Adgangskontrol til private hubs ───────────────────────────────────────────
+// Serveren tjekker selv adgangskoden, når en socket forbinder (klienten sender
+// den som auth.access_code). Koden i DB kan være klartekst (gamle hubs) ELLER
+// krypteret ("v2:…", kontekst "nh_hubs.access_code") — begge dele virker.
+//
+// Miljøvariabler (valgfrie):
+//   HUB_ACCESS_MODE=enforce | log   (standard: enforce)
+//        log = nægter ikke, men skriver i loggen hvem der ville være afvist
+//              (til at teste, at PHP-siden sender koden, før du håndhæver)
+//   LIST_PRIVATE_HUBS=true          (standard: private hubs skjules i /hubs)
+const CTX_ACCESS = "nh_hubs.access_code";
+const ACCESS_MODE = String(
+  process.env.HUB_ACCESS_MODE || "enforce",
+).toLowerCase();
+const LIST_PRIVATE_HUBS = process.env.LIST_PRIVATE_HUBS === "true";
+const ATTEMPT_WINDOW_MS = 10 * 60 * 1000; // 10 min
+const MAX_FAILS_PER_IP_HUB = 5; // forkerte koder pr. IP og hub pr. vindue
+const MAX_FAILS_PER_HUB = 60; // forkerte koder i alt pr. hub pr. vindue
+const failMap = new Map(); // nøgle -> { count, first }
+
+function failCount(key, now) {
+  const r = failMap.get(key);
+  if (!r) return 0;
+  if (now - r.first > ATTEMPT_WINDOW_MS) {
+    failMap.delete(key);
+    return 0;
+  }
+  return r.count;
+}
+function addFail(key, now) {
+  const r = failMap.get(key);
+  if (!r || now - r.first > ATTEMPT_WINDOW_MS)
+    failMap.set(key, { count: 1, first: now });
+  else r.count++;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, r] of failMap)
+    if (now - r.first > ATTEMPT_WINDOW_MS) failMap.delete(k);
+}, 60_000).unref();
+
+// Bag DigitalOcean/proxy: brug proxyens egen header, ikke klientens
+function clientIp(socket) {
+  const h = socket.handshake.headers || {};
+  const fwd = String(h["x-forwarded-for"] || "")
+    .split(",")
+    .pop()
+    .trim();
+  return String(
+    h["do-connecting-ip"] || fwd || socket.handshake.address || "unknown",
+  );
+}
+
+function safeEqual(a, b) {
+  const ha = crypto.createHash("sha256").update(String(a)).digest();
+  const hb = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// → { ok:true } | { ok:false, error:"hub_not_found"|"access_denied"|"too_many_attempts" }
+async function checkHubAccess(socket, hubId, code) {
+  const [rows] = await pool.execute(
+    "SELECT id, is_private, access_code FROM nh_hubs WHERE id = ?",
+    [hubId],
+  );
+  if (!rows.length) return { ok: false, error: "hub_not_found" };
+  const hub = rows[0];
+  if (!hub.is_private) return { ok: true };
+
+  const now = Date.now();
+  const kIp = `${clientIp(socket)}|${hubId}`;
+  const kHub = `hub|${hubId}`;
+  if (
+    failCount(kIp, now) >= MAX_FAILS_PER_IP_HUB ||
+    failCount(kHub, now) >= MAX_FAILS_PER_HUB
+  )
+    return { ok: false, error: "too_many_attempts" };
+
+  const stored =
+    hub.access_code == null
+      ? ""
+      : decryptData(String(hub.access_code), CTX_ACCESS).trim();
+  const given = code == null ? "" : String(code).trim();
+
+  if (stored === "") {
+    // Privat hub uden (læsbar) kode → ingen kommer ind (fail closed)
+    console.error(
+      `[neurohub] hub "${hubId}" er privat men har ingen læsbar access_code`,
+    );
+    return { ok: false, error: "access_denied" };
+  }
+  if (given !== "" && safeEqual(stored, given)) {
+    failMap.delete(kIp);
+    return { ok: true };
+  }
+  // Tom kode (side åbnet uden kode) tæller ikke som forsøg — kun forkerte koder
+  if (given !== "") {
+    addFail(kIp, now);
+    addFail(kHub, now);
+  }
+  return { ok: false, error: "access_denied" };
+}
+
 // ── Admin helpers ─────────────────────────────────────────────────────────────
 function parseIsAdmin(userTypeStr) {
   if (!userTypeStr) return false;
@@ -733,7 +851,8 @@ function startServer() {
       return res.end(
         JSON.stringify({
           ok: true,
-          version: "6.10.0",
+          version: "6.11.0",
+          hubAccessMode: ACCESS_MODE,
           encryption: "aes-256-gcm (v2)",
           schema,
           loadedHubs: [...loadedHubs],
@@ -747,8 +866,10 @@ function startServer() {
 
     if (req.url === "/hubs") {
       try {
+        // Private hubs (fx booking-sessioner) afslører ellers id, tidspunkt og
+        // eksistens for alle → skjules, medmindre LIST_PRIVATE_HUBS=true.
         const [hubs] = await pool.query(
-          "SELECT id, label, is_private FROM nh_hubs ORDER BY created_at DESC LIMIT 50",
+          `SELECT id, label, is_private FROM nh_hubs ${LIST_PRIVATE_HUBS ? "" : "WHERE is_private = 0"} ORDER BY created_at DESC LIMIT 50`,
         );
         res.writeHead(200, { "Content-Type": "application/json" });
         return res.end(JSON.stringify(hubs));
@@ -804,6 +925,31 @@ function startServer() {
     socket.username = String(username).substring(0, 64);
     socket.hubId = String(hub_id || "public").substring(0, 64);
     socket.isAdmin = await resolveAdmin(user_id);
+
+    // 🔒 Adgangskontrol FØR hubben indlæses. Admin-flaget bruges bevidst ikke
+    // til at springe koden over: user_id kommer fra klienten og kan forfalskes.
+    let access;
+    try {
+      access = await checkHubAccess(
+        socket,
+        socket.hubId,
+        socket.handshake.auth?.access_code,
+      );
+    } catch (e) {
+      console.error("[neurohub] checkHubAccess:", e.message);
+      return next(new Error("server_error")); // fail closed
+    }
+    if (!access.ok) {
+      if (access.error === "hub_not_found")
+        return next(new Error("hub_not_found"));
+      console.warn(
+        `[neurohub] adgang nægtet til "${socket.hubId}" (${access.error}) fra ${clientIp(socket)} user=${socket.userId}`,
+      );
+      if (ACCESS_MODE === "enforce") return next(new Error(access.error));
+      console.warn(
+        "[neurohub] HUB_ACCESS_MODE=log → lader forbindelsen igennem",
+      );
+    }
 
     const hubExists = await initHubIfNeeded(socket.hubId);
     if (!hubExists) {
@@ -1378,7 +1524,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.10.0 listening on :${PORT}`);
+    console.log(`[neurohub] v6.11.0 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }
@@ -1392,6 +1538,7 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 bootstrap().catch((err) => {
+  console.error("[neurohub] ⛔ Serveren stoppede: " + (err && err.message));
   console.error("[neurohub] Fatal:", err);
   process.exit(1);
 });

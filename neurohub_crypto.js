@@ -48,6 +48,11 @@ function loadEnvFile(file) {
   }
 }
 
+// Hvor kom nøglen fra? (bruges kun til opstarts-log — selve nøglen logges ALDRIG)
+let keySource = process.env.ENCRYPTION_KEY
+  ? "miljøvariabel ENCRYPTION_KEY"
+  : null;
+
 if (!process.env.ENCRYPTION_KEY) {
   const candidates = [
     process.env.ENCRYPTION_ENV_FILE,
@@ -58,7 +63,10 @@ if (!process.env.ENCRYPTION_KEY) {
   ].filter(Boolean);
   for (const f of candidates) {
     loadEnvFile(f);
-    if (process.env.ENCRYPTION_KEY) break;
+    if (process.env.ENCRYPTION_KEY) {
+      keySource = f;
+      break;
+    }
   }
 }
 
@@ -66,8 +74,10 @@ function rawKeyMaterial() {
   const raw = process.env.ENCRYPTION_KEY;
   if (typeof raw !== "string" || raw === "") {
     throw new Error(
-      "ENCRYPTION_KEY er ikke sat (hverken i miljøet eller i coaching/.env). " +
-        "Sæt ENCRYPTION_KEY eller ENCRYPTION_ENV_FILE.",
+      "ENCRYPTION_KEY mangler. Tilføj den som miljøvariabel i hosting-platformen " +
+        "(fx DigitalOcean → App → Settings → Environment Variables, type Secret) " +
+        "med PRÆCIS samme værdi som ENCRYPTION_KEY i PHP-sidens coaching/.env. " +
+        "Gem den ikke i GitHub-repoet.",
     );
   }
   return raw;
@@ -75,8 +85,17 @@ function rawKeyMaterial() {
 
 // Kaldes ved opstart, så fejlen kommer med det samme og ikke ved første boble.
 function assertKeyConfigured() {
-  rawKeyMaterial();
-  return true;
+  const raw = rawKeyMaterial();
+  // Selvtest: kryptér → dekryptér, så fejl opdages ved opstart og ikke ved første boble
+  const probe = "selftest-æøå-" + Date.now();
+  const back = decryptData(encryptData(probe, "selftest"), "selftest");
+  if (back !== probe) throw new Error("Krypterings-selvtest fejlede.");
+  return {
+    source: keySource,
+    length: raw.length,
+    // PHP-filens hardkodede standardnøgle er offentlig → må ikke bruges til rigtige data
+    insecure: raw === "12345678901234567890123456789012",
+  };
 }
 
 function encryptionKey() {
