@@ -1,48 +1,33 @@
 /**
- * neurohub_server.js — v6.9  (performance + datastruktur)
+ * neurohub_server.js — v6.12  (boble-tekst krypteret, adgangskode i klartekst)
  *
- * v6.9.1 — FIX: "ny boble vises kort og forsvinder igen".
- *   Årsag: migrationerne brugte `ADD COLUMN IF NOT EXISTS`, som MySQL 8 slet
- *   ikke understøtter (kun MariaDB). Fejlen blev slugt lydløst, så kolonnerne
- *   size_w / size_h blev aldrig oprettet, og INSERT INTO nh_bubbles fejlede.
- *   Klienten (v9.11) fjerner en boble der ikke kunne gemmes — derfor så den
- *   ud til at forsvinde. Nu:
- *   · kolonner tjekkes i information_schema og oprettes med almindelig ALTER
- *     (virker på både MySQL 8 og MariaDB)
- *   · INSERT/UPDATE bygges ud fra hvilke kolonner der FAKTISK findes, så
- *     oprettelse af bobler virker selv hvis en ALTER ikke må køres
- *   · den rigtige DB-fejl logges og sendes til klienten (vises i en toast)
+ * v6.12:
+ *   · Boble-tekst (content + emotion) er krypteret i databasen (AES-256-GCM,
+ *     ren base64 uden prefix). Klienterne får klartekst.
+ *   · nh_hubs.access_code er KLARTEKST. Var den krypteret af en tidligere
+ *     version, dekrypteres den automatisk tilbage ved opstart.
+ *   · Login KRÆVER et signeret token fra index.php. Admin afgøres kun af
+ *     serveren via databasen.
+ *   · Private hubs tjekkes på serveren (kode + brute-force-spærring).
+ *   · /reset-hub/... kræver header "x-admin-key" (env ADMIN_HTTP_KEY).
  *
- * CHANGES vs v6.8:
- * - ROD-ÅRSAG TIL LAG RETTET: pixel-handleren kaldte flushPixels() for HELE
- *   hubben (alle pixels, upsert af hver eneste række) for hver eneste pixel,
- *   så snart hubben havde ≥200 pixels (`buf.size >= FLUSH_BATCH` talte alle
- *   pixels, ikke de ændrede). Det spærrede DB-poolen og event-loopet, så alt
- *   andet (fx nye bobler) kom til at vente. Nu holdes en "dirty"-mængde pr.
- *   hub, og kun ændrede pixels skrives (batchet). Sletninger sendes som ét
- *   batchet DELETE ... IN (...). Kun én flush ad gangen pr. hub.
- * - NY: "pixels"-event (batch). Klienten samler pixels og sender dem som én
- *   pakke; serveren validerer alle og broadcaster ÉN pakke til de andre.
- *   Afsenderen får ikke sine egne pixels retur (de er allerede tegnet).
- *   Det gamle enkelt-"pixel"-event virker stadig (bruger samme logik).
- * - bubble_save: svarer (ack) med den færdige boble med det samme efter
- *   INSERT, og broadcaster til de ANDRE. Forbindelsen til forælder gemmes
- *   i DB bagefter. Opretteren får altså ikke længere en dublet-boble retur.
- *   Ugyldigt parent_id ignoreres i stedet for at vælte hele kaldet.
- * - bubble_edit / branch_add / branch_delete broadcaster kun til de ANDRE
- *   (afsenderen har allerede ændret lokalt — et ekko kunne overskrive nyere
- *   værdier midt i et slider-træk).
- * - bubble_move accepterer { final:false } for live-bevægelse (broadcast
- *   uden DB-skrivning); DB opdateres kun ved final (default).
- *
- * (v6.8: size_w/size_h. v6.7: branch_delete, color. v6.6: m.fl.)
+ * Miljøvariabler (DigitalOcean): ENCRYPTION_KEY (SAMME som i PHP), DB_PASS,
+ * ADMIN_HTTP_KEY (valgfri, men nødvendig for /reset-hub).
  */
 "use strict";
 
 const http = require("http");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
 const mysql = require("mysql2/promise");
 require("dotenv").config();
+const {
+  decryptData,
+  encryptStored,
+  decryptStored,
+  inspectStored,
+  assertKeyConfigured,
+} = require("./neurohub_crypto");
 
 const PORT = process.env.PORT || 3001;
 const ALLOWED_ORIGINS = (
@@ -51,6 +36,18 @@ const ALLOWED_ORIGINS = (
 )
   .split(",")
   .map((s) => s.trim());
+const ADMIN_HTTP_KEY = process.env.ADMIN_HTTP_KEY || "";
+
+// ── Krypterings-kontekster (bruges som AAD) ───────────────────────────────────
+const CTX_BUBBLE_CONTENT = "nh_bubble_content";
+const CTX_BUBBLE_EMOTION = "nh_bubble_emotion";
+const CTX_HUB_ACCESS = "nh_hub_access"; // kun brugt til at dekryptere gamle koder tilbage
+const CTX_AUTH_TOKEN = "nh_auth_token";
+
+const encField = (v, ctx) =>
+  v === null || v === undefined ? null : encryptStored(String(v), ctx);
+const decField = (v, ctx) =>
+  v === null || v === undefined ? null : decryptStored(v, ctx);
 
 // ── DB configs ────────────────────────────────────────────────────────────────
 const NEUROHUB_DB = {
@@ -78,14 +75,14 @@ const USERS_DB = {
 // ── RAM caches ────────────────────────────────────────────────────────────────
 const pixelBuffer = new Map();
 const erasedKeys = new Map();
-const bubbleCache = new Map();
+const bubbleCache = new Map(); // indeholder KLARTEKST (kun i RAM)
 const branchCache = new Map();
 const chatCache = new Map();
 const presence = new Map();
 const zoneCache = new Map();
-const adminCache = new Map();
-const dirtyKeys = new Map(); // hubId -> Set("x,y") af pixels der skal skrives til DB
-const flushing = new Set(); // hubIds hvor en flush kører lige nu
+const adminCache = new Map(); // userId -> { v:boolean, until:ms }
+const dirtyKeys = new Map();
+const flushing = new Set();
 
 const loadedHubs = new Set();
 const initPromises = new Map();
@@ -98,16 +95,15 @@ const PIXEL_CELL = 12;
 const MAX_CX = Math.floor(WORLD_W / PIXEL_CELL);
 const MAX_CY = Math.floor(WORLD_H / PIXEL_CELL);
 const MAX_PIXEL_OPS_PER_BATCH = 1000;
+const ADMIN_TTL = 5 * 60 * 1000;
 
 const MIN_BUBBLE_W = 60;
 const MAX_BUBBLE_W = 1000;
 const MIN_BUBBLE_H = 40;
 const MAX_BUBBLE_H = 800;
 const HEX_RE = /^#[0-9a-fA-F]{6}$/;
+const HUB_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
-// null  → nulstil til auto
-// tal   → clampet heltal
-// ugyldigt → undefined (ignoreres)
 function parseDim(v, min, max) {
   if (v === null) return null;
   const n = parseInt(v, 10);
@@ -115,12 +111,13 @@ function parseDim(v, min, max) {
   return Math.min(max, Math.max(min, n));
 }
 
-// Ensartet form på bobler fra DB: size_w/size_h er tal eller null, og den
-// gamle size_scale-kolonne følger ikke med ud til klienterne.
+// Ensartet form på bobler fra DB (+ dekryptering af tekst)
 function normalizeBubbleRow(b) {
   const { size_scale, ...rest } = b;
   return {
     ...rest,
+    content: decField(rest.content, CTX_BUBBLE_CONTENT),
+    emotion: decField(rest.emotion, CTX_BUBBLE_EMOTION),
     size_w: rest.size_w == null ? null : Number(rest.size_w),
     size_h: rest.size_h == null ? null : Number(rest.size_h),
   };
@@ -141,7 +138,6 @@ async function columnExists(table, column) {
   return Number(rows[0].c) > 0;
 }
 
-// Returnerer true hvis kolonnen findes (eller blev oprettet)
 async function ensureColumn(table, column, ddl) {
   try {
     if (await columnExists(table, column)) return true;
@@ -173,8 +169,78 @@ async function ensureUniqueIndex(table, name, cols) {
   }
 }
 
+// ── Migrationer ───────────────────────────────────────────────────────────────
+
+// Adgangskoder skal være KLARTEKST. Er en kode krypteret (fra en tidligere
+// version), dekrypteres den og skrives tilbage som klartekst.
+async function restoreHubCodesToPlain() {
+  try {
+    const [hubs] = await pool.query(
+      "SELECT id, access_code FROM nh_hubs WHERE access_code IS NOT NULL AND access_code <> ''",
+    );
+    let n = 0;
+    for (const h of hubs) {
+      const r = inspectStored(h.access_code, CTX_HUB_ACCESS);
+      if (r.state === "ok") {
+        await pool.execute("UPDATE nh_hubs SET access_code=? WHERE id=?", [
+          r.text,
+          h.id,
+        ]);
+        n++;
+      } else if (r.state === "bad") {
+        console.warn(
+          `[neurohub] hub "${h.id}": adgangskoden ligner krypteret men kan ikke dekrypteres (forkert ENCRYPTION_KEY?) — rører den ikke`,
+        );
+      }
+    }
+    if (n)
+      console.log(`[neurohub] restored ${n} hub access code(s) to plaintext`);
+  } catch (e) {
+    console.error("[neurohub] restoreHubCodesToPlain:", e.message);
+  }
+}
+
+// Boble-tekst skal være krypteret uden prefix. Klartekst krypteres, "v2:"-
+// prefix fjernes. Værdier der ikke kan dekrypteres, røres ikke.
+function migratedValue(value, ctx) {
+  const r = inspectStored(value, ctx);
+  if (r.state === "plain") return encryptStored(r.text, ctx);
+  if (r.state === "ok" && r.hasPrefix) return encryptStored(r.text, ctx);
+  if (r.state === "bad")
+    console.warn(
+      "[neurohub] migration: en værdi kan ikke dekrypteres (forkert ENCRYPTION_KEY?) — rører den ikke",
+    );
+  return null;
+}
+
+async function migrateBubbleText() {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, content, emotion FROM nh_bubbles
+       WHERE (content IS NOT NULL AND content <> '')
+          OR (emotion IS NOT NULL AND emotion <> '')`,
+    );
+    let n = 0;
+    for (const r of rows) {
+      const c = migratedValue(r.content, CTX_BUBBLE_CONTENT);
+      const e = migratedValue(r.emotion, CTX_BUBBLE_EMOTION);
+      if (c === null && e === null) continue;
+      await pool.execute(
+        "UPDATE nh_bubbles SET content=?, emotion=? WHERE id=?",
+        [c !== null ? c : r.content, e !== null ? e : r.emotion, r.id],
+      );
+      n++;
+    }
+    if (n) console.log(`[neurohub] migrated text of ${n} bubble(s)`);
+  } catch (e) {
+    console.error("[neurohub] migrateBubbleText:", e.message);
+  }
+}
+
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 async function bootstrap() {
+  assertKeyConfigured(); // stopper opstart hvis ENCRYPTION_KEY mangler
+
   pool = await mysql.createPool(NEUROHUB_DB);
   usersPool = await mysql.createPool(USERS_DB);
   console.log("[neurohub] Both DB pools connected");
@@ -186,8 +252,6 @@ async function bootstrap() {
     console.error("[neurohub] WARNING: Cannot read users table:", e.message);
   }
 
-  // Schema extensions — kører FØR warmUp(). Bruger information_schema i stedet
-  // for "IF NOT EXISTS" (som MySQL 8 ikke kender for ADD COLUMN).
   await ensureColumn("nh_pixels", "locked", "TINYINT(1) NOT NULL DEFAULT 0");
   await ensureColumn(
     "nh_pixels",
@@ -211,6 +275,10 @@ async function bootstrap() {
   );
   await ensureUniqueIndex("nh_pixels", "ux_hub_xy", "(hub_id,x,y)");
   console.log("[neurohub] schema:", JSON.stringify(schema));
+
+  // FØR warm-up
+  await restoreHubCodesToPlain();
+  await migrateBubbleText();
 
   await warmUp();
   setInterval(flushAllPixels, FLUSH_INTERVAL);
@@ -236,7 +304,6 @@ async function warmUp() {
     });
   });
 
-  // SELECT * så size_w / size_h / emotion_icon_id automatisk følger med
   const [bubbles] = await pool.query("SELECT * FROM nh_bubbles");
   bubbles.forEach((b) => {
     loadedHubs.add(b.hub_id);
@@ -299,7 +366,9 @@ function ensureHubBuffers(hubId) {
 // ── RAM reset for a hub ───────────────────────────────────────────────────────
 async function resetHubRAM(hubId) {
   console.log(`[neurohub] resetHubRAM: clearing RAM for hub "${hubId}"`);
-  erasedKeys.get(hubId)?.clear();
+  await flushPixels(hubId).catch((e) =>
+    console.error("[neurohub] flush before reset:", e.message),
+  );
   pixelBuffer.set(hubId, new Map());
   erasedKeys.set(hubId, new Set());
   dirtyKeys.set(hubId, new Set());
@@ -346,7 +415,6 @@ async function _doInitHub(hubId) {
       return false;
     }
 
-    // ── KOPIERING AF DEFAULT ELEMENTER HVIS HUBBEN ER HELT TOM ──
     const [pCheck] = await pool.query(
       "SELECT 1 FROM nh_pixels WHERE hub_id = ? LIMIT 1",
       [hubId],
@@ -387,7 +455,6 @@ async function _doInitHub(hubId) {
       }
     }
 
-    // Load pixels
     const [pixels] = await pool.query(
       "SELECT * FROM nh_pixels WHERE hub_id = ?",
       [hubId],
@@ -404,7 +471,6 @@ async function _doInitHub(hubId) {
       });
     });
 
-    // Load zones
     const [zones] = await pool.query(
       "SELECT * FROM nh_admin_zones WHERE hub_id = ?",
       [hubId],
@@ -420,7 +486,6 @@ async function _doInitHub(hubId) {
       });
     });
 
-    // Load bubbles (SELECT * picks up emotion_icon_id + size_w + size_h)
     const [bubbles] = await pool.query(
       "SELECT * FROM nh_bubbles WHERE hub_id = ?",
       [hubId],
@@ -429,7 +494,6 @@ async function _doInitHub(hubId) {
       bubbleCache.get(hubId).set(b.id, normalizeBubbleRow(b)),
     );
 
-    // Load branches
     const [branches] = await pool.query(
       "SELECT * FROM nh_branches WHERE hub_id = ?",
       [hubId],
@@ -438,7 +502,6 @@ async function _doInitHub(hubId) {
       branchCache.get(hubId).add(`${br.parent_id}-${br.child_id}`),
     );
 
-    // Load chat
     const [chats] = await pool.query(
       "SELECT * FROM nh_chat WHERE hub_id = ? ORDER BY id DESC LIMIT 50",
       [hubId],
@@ -463,7 +526,32 @@ async function _doInitHub(hubId) {
   }
 }
 
-// ── Admin helpers ─────────────────────────────────────────────────────────────
+// ── Login: token, admin, hub-adgang ───────────────────────────────────────────
+
+// Token laves af index.php: encryptData(json, "nh_auth_token"). AES-GCM er
+// autentificeret, så et token kan ikke forfalskes uden ENCRYPTION_KEY.
+function verifyAuthToken(token) {
+  if (
+    typeof token !== "string" ||
+    token.length < 20 ||
+    token.length > 4096 ||
+    !token.startsWith("v2:")
+  )
+    return null;
+  const plain = decryptData(token, CTX_AUTH_TOKEN);
+  if (!plain) return null;
+  let p;
+  try {
+    p = JSON.parse(plain);
+  } catch (_) {
+    return null;
+  }
+  if (!p || p.t !== "nh_auth" || !p.uid || !p.un) return null;
+  if (typeof p.exp !== "number" || p.exp < Math.floor(Date.now() / 1000))
+    return null;
+  return { userId: String(p.uid), username: String(p.un) };
+}
+
 function parseIsAdmin(userTypeStr) {
   if (!userTypeStr) return false;
   return userTypeStr
@@ -472,25 +560,90 @@ function parseIsAdmin(userTypeStr) {
     .includes("admin");
 }
 
+// Admin afgøres KUN her, ud fra det verificerede user_id og databasen.
 async function resolveAdmin(userId) {
-  const cacheKey = String(userId);
-  if (adminCache.has(cacheKey)) return adminCache.get(cacheKey);
+  const k = String(userId);
+  const c = adminCache.get(k);
+  if (c && c.until > Date.now()) return c.v;
+  let isAdmin = false;
   try {
     const [rows] = await usersPool.execute(
-      "SELECT user_type FROM users WHERE id=? OR user_id=? LIMIT 1",
-      [userId, userId],
+      "SELECT user_type FROM users WHERE user_id=? LIMIT 1",
+      [k],
     );
-    if (rows.length > 0) {
-      const isAdmin = parseIsAdmin(rows[0].user_type);
-      adminCache.set(cacheKey, isAdmin);
-      return isAdmin;
-    }
-  } catch (e) {}
-  adminCache.set(cacheKey, false);
-  setTimeout(() => adminCache.delete(cacheKey), 5 * 60 * 1000);
-  return false;
+    if (rows.length > 0) isAdmin = parseIsAdmin(rows[0].user_type);
+  } catch (e) {
+    console.error("[neurohub] resolveAdmin:", e.message);
+    return false; // fejl caches ikke
+  }
+  adminCache.set(k, { v: isAdmin, until: Date.now() + ADMIN_TTL });
+  return isAdmin;
 }
 
+const sha = (s) =>
+  crypto.createHash("sha256").update(String(s).trim().toLowerCase()).digest();
+const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
+
+// Brute-force-spærring for adgangskoder: 10 fejl pr. 10 min pr. bruger/IP
+const codeFails = new Map();
+const MAX_FAILS = 10;
+const FAIL_WINDOW = 10 * 60 * 1000;
+function isLockedOut(keys) {
+  const now = Date.now();
+  return keys.some((k) => {
+    const f = codeFails.get(k);
+    return f && f.until > now && f.n >= MAX_FAILS;
+  });
+}
+function registerFail(keys) {
+  const now = Date.now();
+  keys.forEach((k) => {
+    let f = codeFails.get(k);
+    if (!f || f.until <= now) f = { n: 0, until: now + FAIL_WINDOW };
+    f.n++;
+    codeFails.set(k, f);
+  });
+}
+function clearFails(keys) {
+  keys.forEach((k) => codeFails.delete(k));
+}
+setInterval(() => {
+  const now = Date.now();
+  codeFails.forEach((f, k) => {
+    if (f.until <= now) codeFails.delete(k);
+  });
+}, FAIL_WINDOW);
+
+// Returnerer "ok" | "not_found" | "access_denied" | "too_many_attempts"
+async function checkHubAccess(socket, hubId, code) {
+  if (hubId === "public") return "ok";
+  const [rows] = await pool.execute(
+    "SELECT is_private, access_code FROM nh_hubs WHERE id=? LIMIT 1",
+    [hubId],
+  );
+  if (!rows.length) return "not_found";
+  if (!rows[0].is_private) return "ok";
+
+  const ip =
+    String(socket.handshake.headers["x-forwarded-for"] || "")
+      .split(",")[0]
+      .trim() || socket.handshake.address;
+  const keys = [`u:${socket.userId}`, `ip:${ip}`];
+
+  if (isLockedOut(keys)) return "too_many_attempts";
+  if (!code) return "access_denied";
+
+  // Adgangskoden står i klartekst i databasen
+  const stored = String(rows[0].access_code || "");
+  if (stored && safeEqual(stored, String(code).substring(0, 64))) {
+    clearFails(keys);
+    return "ok";
+  }
+  registerFail(keys);
+  return "access_denied";
+}
+
+// ── Zone helpers ──────────────────────────────────────────────────────────────
 function isInLockedZone(hubId, cx, cy) {
   const zones = zoneCache.get(hubId);
   if (!zones) return false;
@@ -510,7 +663,6 @@ function getZoneAt(hubId, cx, cy) {
 }
 
 // ── DB flushing ───────────────────────────────────────────────────────────────
-// Skriver KUN de pixels der er ændret siden sidst (dirty) + sletninger.
 async function flushPixels(hubId) {
   if (flushing.has(hubId)) return;
   flushing.add(hubId);
@@ -537,7 +689,7 @@ async function flushPixels(hubId) {
           );
         } catch (err) {
           console.error("[neurohub] pixel delete error:", err.message);
-          chunk.forEach((k) => erased.add(k)); // prøv igen næste gang
+          chunk.forEach((k) => erased.add(k));
         }
       }
     }
@@ -571,7 +723,7 @@ async function flushPixels(hubId) {
           );
         } catch (err) {
           console.error("[neurohub] pixel upsert error:", err.message);
-          chunk.forEach((p) => dirty.add(`${p.x},${p.y}`)); // prøv igen næste gang
+          chunk.forEach((p) => dirty.add(`${p.x},${p.y}`));
         }
       }
     }
@@ -621,6 +773,12 @@ function presenceList(hubId) {
 }
 
 // ── HTTP + Socket server ───────────────────────────────────────────────────────
+function httpKeyOk(req) {
+  if (!ADMIN_HTTP_KEY) return false; // ikke sat = endpoint er slået fra
+  const given = String(req.headers["x-admin-key"] || "");
+  return given !== "" && safeEqual(given, ADMIN_HTTP_KEY);
+}
+
 function startServer() {
   const httpServer = http.createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -635,7 +793,7 @@ function startServer() {
       return res.end(
         JSON.stringify({
           ok: true,
-          version: "6.9.1",
+          version: "6.12",
           schema,
           loadedHubs: [...loadedHubs],
           pixelCounts: Object.fromEntries(
@@ -661,7 +819,15 @@ function startServer() {
 
     const resetMatch = req.url.match(/^\/reset-hub\/([^/?]+)/);
     if (resetMatch) {
+      if (!httpKeyOk(req)) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: "forbidden" }));
+      }
       const hubId = decodeURIComponent(resetMatch[1]);
+      if (!HUB_ID_RE.test(hubId)) {
+        res.writeHead(400);
+        return res.end();
+      }
       console.log(`[neurohub] HTTP /reset-hub/${hubId} called`);
       try {
         const state = await resetHubRAM(hubId);
@@ -697,21 +863,34 @@ function startServer() {
     pingTimeout: 25_000,
   });
 
+  // ── Auth-middleware ─────────────────────────────────────────────────────────
   io.use(async (socket, next) => {
-    const { user_id, username, hub_id } = socket.handshake.auth || {};
-    if (!user_id || !username) return next(new Error("auth_required"));
+    try {
+      const auth = socket.handshake.auth || {};
 
-    socket.userId = String(user_id);
-    socket.username = String(username).substring(0, 64);
-    socket.hubId = String(hub_id || "public").substring(0, 64);
-    socket.isAdmin = await resolveAdmin(user_id);
+      // Identitet kommer KUN fra det signerede token — aldrig fra user_id/username
+      const who = verifyAuthToken(auth.token);
+      if (!who) return next(new Error("invalid_token"));
 
-    const hubExists = await initHubIfNeeded(socket.hubId);
-    if (!hubExists) {
-      return next(new Error("hub_not_found"));
+      const hubId = String(auth.hub_id || "public");
+      if (!HUB_ID_RE.test(hubId)) return next(new Error("hub_not_found"));
+
+      socket.userId = who.userId;
+      socket.username = who.username.substring(0, 64);
+      socket.hubId = hubId;
+
+      const access = await checkHubAccess(socket, hubId, auth.access_code);
+      if (access !== "ok") return next(new Error(access));
+
+      const hubExists = await initHubIfNeeded(hubId);
+      if (!hubExists) return next(new Error("hub_not_found"));
+
+      socket.isAdmin = await resolveAdmin(socket.userId);
+      next();
+    } catch (e) {
+      console.error("[neurohub] auth middleware:", e.message);
+      next(new Error("auth_failed"));
     }
-
-    next();
   });
 
   io.on("connection", (socket) => {
@@ -729,7 +908,6 @@ function startServer() {
     });
     io.to(hubId).emit("presence_list", presenceList(hubId));
 
-    // Fælles logik for ét pixel-forsøg. Returnerer intet; resultater samles i `out`.
     function handlePixelOp(data, out) {
       const x = parseInt(data?.x),
         y = parseInt(data?.y);
@@ -807,7 +985,7 @@ function startServer() {
     });
 
     socket.on("chat", async (data) => {
-      const message = String(data.message || "")
+      const message = String(data?.message || "")
         .trim()
         .substring(0, 500);
       if (!message) return;
@@ -825,8 +1003,14 @@ function startServer() {
     });
 
     socket.on("move", (data) => {
-      const x = Math.max(0, Math.min(WORLD_W, parseInt(data.x) || WORLD_W / 2));
-      const y = Math.max(0, Math.min(WORLD_H, parseInt(data.y) || WORLD_H / 2));
+      const x = Math.max(
+        0,
+        Math.min(WORLD_W, parseInt(data?.x) || WORLD_W / 2),
+      );
+      const y = Math.max(
+        0,
+        Math.min(WORLD_H, parseInt(data?.y) || WORLD_H / 2),
+      );
       const p = getPresence(hubId).get(socket.id);
       if (p) {
         p.x = x;
@@ -836,6 +1020,7 @@ function startServer() {
     });
 
     socket.on("bubble_save", async (data, ack) => {
+      data = data || {};
       const type = data.type === "emotion" ? "emotion" : "brain";
       const x = Math.max(0, parseInt(data.x) || 100);
       const y = Math.max(0, parseInt(data.y) || 100);
@@ -852,7 +1037,6 @@ function startServer() {
       const sizeH =
         parseDim(data.size_h ?? null, MIN_BUBBLE_H, MAX_BUBBLE_H) ?? null;
 
-      // 0 skal kunne gemmes — Number.isFinite i stedet for `|| 5`
       const rawVal = parseInt(data.emotion_val, 10);
       const emotionVal =
         type === "emotion"
@@ -865,7 +1049,6 @@ function startServer() {
       const emotionIconId =
         type === "emotion" && Number.isFinite(rawIconId) ? rawIconId : null;
 
-      // Kun forælder der faktisk findes i denne hub tæller
       let parentId = null;
       if (data.parent_id !== undefined && data.parent_id !== null) {
         const pid = parseInt(data.parent_id, 10);
@@ -874,7 +1057,6 @@ function startServer() {
       }
 
       try {
-        // Byg INSERT ud fra de kolonner der faktisk findes
         const cols = [
           "hub_id",
           "type",
@@ -885,7 +1067,17 @@ function startServer() {
           "emotion",
           "emotion_val",
         ];
-        const vals = [hubId, type, x, y, color, content, emotion, emotionVal];
+        // Teksten krypteres FØR den skrives til databasen
+        const vals = [
+          hubId,
+          type,
+          x,
+          y,
+          color,
+          encField(content, CTX_BUBBLE_CONTENT),
+          encField(emotion, CTX_BUBBLE_EMOTION),
+          emotionVal,
+        ];
         if (schema.emotion_icon_id) {
           cols.push("emotion_icon_id");
           vals.push(emotionIconId);
@@ -905,6 +1097,7 @@ function startServer() {
           vals,
         );
         const bubbleId = res.insertId;
+        // RAM/klienter arbejder med klartekst
         const bubble = {
           id: bubbleId,
           type,
@@ -920,15 +1113,12 @@ function startServer() {
           username,
           user_id: userId,
         };
-        // Cache først, så alt andet (andre brugere, branch_add) kan se boblen
         bubbleCache.get(hubId).set(bubbleId, bubble);
         if (parentId !== null)
           branchCache.get(hubId).add(`${parentId}-${bubbleId}`);
 
-        // Svar opretteren STRAKS (klienten har allerede tegnet boblen)
         if (typeof ack === "function") ack({ ok: true, id: bubbleId, bubble });
 
-        // De andre får boblen + forbindelsen
         socket.to(hubId).emit("bubble_update", bubble);
         if (parentId !== null)
           socket.to(hubId).emit("branch_add", {
@@ -936,7 +1126,6 @@ function startServer() {
             child_id: bubbleId,
           });
 
-        // Forbindelsen persisteres bagefter (ikke på den kritiske vej)
         if (parentId !== null) {
           try {
             await pool.execute(
@@ -959,16 +1148,16 @@ function startServer() {
     });
 
     socket.on("bubble_move", async (data) => {
-      const id = parseInt(data.id),
-        x = parseInt(data.x),
-        y = parseInt(data.y);
+      const id = parseInt(data?.id),
+        x = parseInt(data?.x),
+        y = parseInt(data?.y);
       if (isNaN(id) || isNaN(x) || isNaN(y)) return;
       const b = bubbleCache.get(hubId)?.get(id);
       if (!b) return;
       b.x = x;
       b.y = y;
       socket.to(hubId).emit("bubble_moved", { id, x, y });
-      if (data.final === false) return; // live-bevægelse: ingen DB-skrivning
+      if (data.final === false) return;
       try {
         await pool.execute(
           "UPDATE nh_bubbles SET x=?,y=? WHERE id=? AND hub_id=?",
@@ -977,11 +1166,8 @@ function startServer() {
       } catch (_) {}
     });
 
-    // bubble_edit — opdaterer kun de felter der faktisk er sendt:
-    //   color, size_w, size_h  (alle bobler; size_* = null nulstiller til auto)
-    //   emotion, emotion_val, emotion_icon_id  (emotion-bobler)
-    //   content  (thought-bobler)
     socket.on("bubble_edit", async (data) => {
+      data = data || {};
       const id = parseInt(data.id);
       if (isNaN(id)) return;
       const b = bubbleCache.get(hubId)?.get(id);
@@ -1021,9 +1207,8 @@ function startServer() {
         if (data.emotion !== undefined) {
           b.emotion = String(data.emotion).substring(0, 64);
           sets.push("emotion=?");
-          vals.push(b.emotion);
+          vals.push(encField(b.emotion, CTX_BUBBLE_EMOTION)); // krypteret i DB
         }
-        // 0 skal kunne gemmes — samme fix som i bubble_save
         if (data.emotion_val !== undefined) {
           const parsed = parseInt(data.emotion_val, 10);
           b.emotion_val = Number.isFinite(parsed)
@@ -1044,7 +1229,7 @@ function startServer() {
         if (data.content !== undefined) {
           b.content = String(data.content).substring(0, 500);
           sets.push("content=?");
-          vals.push(b.content);
+          vals.push(encField(b.content, CTX_BUBBLE_CONTENT)); // krypteret i DB
         }
       }
 
@@ -1062,7 +1247,7 @@ function startServer() {
     });
 
     socket.on("bubble_delete", async (data) => {
-      const id = parseInt(data.id);
+      const id = parseInt(data?.id);
       if (isNaN(id)) return;
       bubbleCache.get(hubId)?.delete(id);
       const bc = branchCache.get(hubId);
@@ -1084,10 +1269,9 @@ function startServer() {
       } catch (_) {}
     });
 
-    // Forbinder to bobler der ALLEREDE findes.
     socket.on("branch_add", async (data, ack) => {
-      const parentId = parseInt(data.parent_id);
-      const childId = parseInt(data.child_id);
+      const parentId = parseInt(data?.parent_id);
+      const childId = parseInt(data?.child_id);
       if (isNaN(parentId) || isNaN(childId) || parentId === childId) {
         if (typeof ack === "function")
           ack({ ok: false, reason: "invalid_ids" });
@@ -1126,8 +1310,6 @@ function startServer() {
       }
     });
 
-    // Sletter ÉN specifik forbindelse mellem to bobler (uanset retning).
-    // Boblerne selv røres ikke.
     socket.on("branch_delete", async (data, ack) => {
       const parentId = parseInt(data?.parent_id);
       const childId = parseInt(data?.child_id);
@@ -1162,17 +1344,19 @@ function startServer() {
       }
     });
 
+    // ── Admin-zoner: kun for brugere som SERVEREN har verificeret som admin ──
     socket.on("zone_add", async (data, ack) => {
       if (!isAdmin) {
         if (typeof ack === "function") ack({ ok: false, reason: "not_admin" });
         return;
       }
+      data = data || {};
       const x = parseInt(data.x),
         y = parseInt(data.y),
         w = parseInt(data.w),
         h = parseInt(data.h);
       const label = String(data.label || "").substring(0, 64);
-      if (isNaN(x) || isNaN(y) || w < 1 || h < 1) {
+      if (isNaN(x) || isNaN(y) || isNaN(w) || isNaN(h) || w < 1 || h < 1) {
         if (typeof ack === "function") ack({ ok: false });
         return;
       }
@@ -1216,7 +1400,7 @@ function startServer() {
         if (typeof ack === "function") ack({ ok: false, reason: "not_admin" });
         return;
       }
-      const id = parseInt(data.id);
+      const id = parseInt(data?.id);
       if (isNaN(id)) return;
       const zone = zoneCache.get(hubId)?.get(id);
       if (!zone) {
@@ -1246,7 +1430,10 @@ function startServer() {
       if (unlockedPixels.length > 0)
         io.to(hubId).emit("pixels_locked", unlockedPixels);
       try {
-        await pool.execute("DELETE FROM nh_admin_zones WHERE id=?", [id]);
+        await pool.execute(
+          "DELETE FROM nh_admin_zones WHERE id=? AND hub_id=?",
+          [id, hubId],
+        );
         await pool.execute(
           "UPDATE nh_pixels SET locked=0, locked_by_zone=0 WHERE hub_id=? AND x>=? AND x<? AND y>=? AND y<? AND locked_by_zone=1",
           [hubId, zone.x, zone.x + zone.w, zone.y, zone.y + zone.h],
@@ -1264,7 +1451,7 @@ function startServer() {
   });
 
   httpServer.listen(PORT, () => {
-    console.log(`[neurohub] v6.9.1 listening on :${PORT}`);
+    console.log(`[neurohub] v6.12 listening on :${PORT}`);
     console.log(`[neurohub] CORS: ${ALLOWED_ORIGINS.join(", ")}`);
   });
 }

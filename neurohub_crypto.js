@@ -3,20 +3,22 @@
  *
  * Placering: samme mappe som neurohub_server.js (fx /public_html/hub/js/).
  *
- * Er 100 % format-kompatibel med PHP-filen, så PHP og Node kan læse hinandens data:
+ * Algoritme (samme som PHP):
  *   · AES-256-GCM
  *   · nøgle  = SHA-256( ENCRYPTION_KEY )  (32 bytes)
  *   · iv     = 12 tilfældige bytes, tag = 16 bytes
- *   · format = "v2:" + base64( iv . tag . ciphertext )
- *   · $context i PHP == `context` her (bruges som AAD)
+ *   · rå bytes = iv . tag . ciphertext
+ *   · context (AAD) == $context i PHP
+ *
+ * To formater:
+ *   · encryptData / decryptData     → "v2:" + base64(...)  (som PHP, bruges til login-token)
+ *   · encryptStored / decryptStored → base64(...) UDEN prefix (bruges til boble-tekst i DB)
+ *     decryptStored kan også læse værdier med "v2:" og gammel klartekst.
  *
  * ENCRYPTION_KEY læses fra process.env — og hvis den ikke er sat derfra, fra
- * den samme .env som PHP bruger (coaching/.env). Stien kan overstyres med
- *   ENCRYPTION_ENV_FILE=/absolut/sti/til/.env
+ * coaching/.env. Stien kan overstyres med ENCRYPTION_ENV_FILE=/absolut/sti/.env
  *
- * Forskel fra PHP: hvis ENCRYPTION_KEY mangler, falder PHP tilbage til en
- * hardkodet standardnøgle. Det gør Node IKKE — serveren nægter at starte,
- * så personfølsomme data aldrig krypteres med en offentlig nøgle.
+ * Hvis ENCRYPTION_KEY mangler, nægter serveren at starte (ingen offentlig standardnøgle).
  */
 "use strict";
 
@@ -25,8 +27,9 @@ const fs = require("fs");
 const path = require("path");
 
 const CIPHER = "aes-256-gcm";
+const B64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
-// ── .env-loader (samme logik som loadEnv() i PHP) ────────────────────────────
+// ── .env-loader ──────────────────────────────────────────────────────────────
 function loadEnvFile(file) {
   try {
     if (!file || !fs.existsSync(file)) return false;
@@ -51,7 +54,7 @@ function loadEnvFile(file) {
 if (!process.env.ENCRYPTION_KEY) {
   const candidates = [
     process.env.ENCRYPTION_ENV_FILE,
-    path.resolve(__dirname, "../../coaching/.env"), // /public_html/hub/js → /public_html/coaching/.env
+    path.resolve(__dirname, "../../coaching/.env"),
     path.resolve(__dirname, "../coaching/.env"),
     path.resolve(__dirname, "coaching/.env"),
     path.resolve(__dirname, ".env"),
@@ -73,7 +76,6 @@ function rawKeyMaterial() {
   return raw;
 }
 
-// Kaldes ved opstart, så fejlen kommer med det samme og ikke ved første boble.
 function assertKeyConfigured() {
   rawKeyMaterial();
   return true;
@@ -94,9 +96,8 @@ function isEncrypted(v) {
   return typeof v === "string" && v.startsWith("v2:");
 }
 
-/** Krypterer med AES-256-GCM. null/"" → "" (som i PHP). */
-function encryptData(data, context = "") {
-  if (data === null || data === undefined || data === "") return "";
+// ── Kernen: rå bytes <-> base64 ──────────────────────────────────────────────
+function encryptToBase64(data, context) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv(CIPHER, encryptionKey(), iv, {
     authTagLength: 16,
@@ -107,7 +108,7 @@ function encryptData(data, context = "") {
     cipher.final(),
   ]);
   const tag = cipher.getAuthTag();
-  return "v2:" + Buffer.concat([iv, tag, ct]).toString("base64");
+  return Buffer.concat([iv, tag, ct]).toString("base64");
 }
 
 function tryDecrypt(ct, key, iv, tag, context) {
@@ -121,21 +122,15 @@ function tryDecrypt(ct, key, iv, tag, context) {
   }
 }
 
-/**
- * Dekrypterer "v2:"-data. Data der IKKE starter med "v2:" returneres uændret
- * (gamle, endnu ikke migrerede klartekst-rækker). Kan en v2-værdi ikke
- * dekrypteres, returneres "" (som i PHP) og der logges en advarsel.
- */
-function decryptData(data, context = "") {
-  if (data === null || data === undefined || data === "") return "";
-  if (!isEncrypted(data)) return data;
-
-  const buf = Buffer.from(data.slice(3), "base64");
-  if (buf.length < 28) return "";
+// Returnerer klartekst eller null hvis base64-strengen ikke kan dekrypteres
+function decryptFromBase64(b64, context) {
+  if (typeof b64 !== "string" || b64.length < 40 || !B64_RE.test(b64))
+    return null;
+  const buf = Buffer.from(b64, "base64");
+  if (buf.length < 28) return null;
   const iv = buf.subarray(0, 12);
   const tag = buf.subarray(12, 28);
   const ct = buf.subarray(28);
-
   for (const key of [encryptionKey(), legacyKey()]) {
     let plain = tryDecrypt(ct, key, iv, tag, context);
     if (plain !== null) return plain;
@@ -144,10 +139,77 @@ function decryptData(data, context = "") {
       if (plain !== null) return plain;
     }
   }
+  return null;
+}
+
+// ── Format MED "v2:" (kompatibelt med PHP encryptData/decryptData) ───────────
+function encryptData(data, context = "") {
+  if (data === null || data === undefined || data === "") return "";
+  return "v2:" + encryptToBase64(data, context);
+}
+
+function decryptData(data, context = "") {
+  if (data === null || data === undefined || data === "") return "";
+  if (!isEncrypted(data)) return data;
+  const plain = decryptFromBase64(data.slice(3), context);
+  if (plain !== null) return plain;
   console.warn(
     "[neurohub] decryptData: kunne ikke dekryptere en værdi (forkert nøgle/kontekst?)",
   );
   return "";
 }
 
-module.exports = { encryptData, decryptData, isEncrypted, assertKeyConfigured };
+// ── Format UDEN prefix (bruges til boble-tekst i neurohub-databasen) ─────────
+/** Krypterer til ren base64. null/"" → "". */
+function encryptStored(data, context = "") {
+  if (data === null || data === undefined || data === "") return "";
+  return encryptToBase64(data, context);
+}
+
+/**
+ * Undersøger en værdi fra databasen.
+ *   state "empty" : tom
+ *   state "plain" : ikke krypteret (gammel klartekst)
+ *   state "ok"    : krypteret og dekrypteret (text = klartekst, hasPrefix = havde "v2:")
+ *   state "bad"   : ligner krypteret men kan ikke dekrypteres (forkert nøgle?)
+ */
+function inspectStored(value, context = "") {
+  if (value === null || value === undefined || value === "")
+    return { state: "empty", text: "", hasPrefix: false };
+  const s = String(value);
+  const hasPrefix = s.startsWith("v2:");
+  const body = hasPrefix ? s.slice(3) : s;
+  const looksB64 = body.length >= 40 && B64_RE.test(body);
+  if (!looksB64)
+    return hasPrefix
+      ? { state: "bad", text: "", hasPrefix }
+      : { state: "plain", text: s, hasPrefix };
+  const plain = decryptFromBase64(body, context);
+  if (plain !== null) return { state: "ok", text: plain, hasPrefix };
+  return { state: "bad", text: "", hasPrefix };
+}
+
+/**
+ * Læser en gemt værdi: krypteret (med eller uden "v2:") → klartekst,
+ * gammel klartekst → uændret, ikke-dekrypterbar → "" (og advarsel).
+ */
+function decryptStored(value, context = "") {
+  const r = inspectStored(value, context);
+  if (r.state === "bad") {
+    console.warn(
+      "[neurohub] decryptStored: kunne ikke dekryptere en værdi (forkert nøgle/kontekst?)",
+    );
+    return "";
+  }
+  return r.text;
+}
+
+module.exports = {
+  encryptData,
+  decryptData,
+  isEncrypted,
+  assertKeyConfigured,
+  encryptStored,
+  decryptStored,
+  inspectStored,
+};
