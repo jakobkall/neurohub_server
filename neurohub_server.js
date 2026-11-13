@@ -528,27 +528,39 @@ async function _doInitHub(hubId) {
 
 // ── Login: token, admin, hub-adgang ───────────────────────────────────────────
 
-// Token laves af index.php: encryptData(json, "nh_auth_token"). AES-GCM er
-// autentificeret, så et token kan ikke forfalskes uden ENCRYPTION_KEY.
 function verifyAuthToken(token) {
-  if (
-    typeof token !== "string" ||
-    token.length < 20 ||
-    token.length > 4096 ||
-    !token.startsWith("v2:")
-  )
+  if (typeof token !== "string" || token === "") {
+    console.warn(
+      "[neurohub] token mangler (er index.php opdateret og uploadet?)",
+    );
     return null;
+  }
+  if (token.length < 20 || token.length > 4096 || !token.startsWith("v2:")) {
+    console.warn("[neurohub] token har forkert format");
+    return null;
+  }
   const plain = decryptData(token, CTX_AUTH_TOKEN);
-  if (!plain) return null;
+  if (!plain) {
+    console.warn(
+      "[neurohub] token kunne ikke dekrypteres — ENCRYPTION_KEY på serveren er IKKE den samme som i PHP",
+    );
+    return null;
+  }
   let p;
   try {
     p = JSON.parse(plain);
   } catch (_) {
+    console.warn("[neurohub] token indeholder ugyldig JSON");
     return null;
   }
-  if (!p || p.t !== "nh_auth" || !p.uid || !p.un) return null;
-  if (typeof p.exp !== "number" || p.exp < Math.floor(Date.now() / 1000))
+  if (!p || p.t !== "nh_auth" || !p.uid || !p.un) {
+    console.warn("[neurohub] token mangler felter");
     return null;
+  }
+  if (typeof p.exp !== "number" || p.exp < Math.floor(Date.now() / 1000)) {
+    console.warn("[neurohub] token er udløbet");
+    return null;
+  }
   return { userId: String(p.uid), username: String(p.un) };
 }
 
@@ -863,7 +875,6 @@ function startServer() {
     pingTimeout: 25_000,
   });
 
-  // ── Auth-middleware ─────────────────────────────────────────────────────────
   io.use(async (socket, next) => {
     try {
       const auth = socket.handshake.auth || {};
